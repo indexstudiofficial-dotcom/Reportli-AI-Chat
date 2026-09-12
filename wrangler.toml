@@ -1,3 +1,3 @@
-name = "reportli-chat-worker"
+name = "chatwith"
 main = "index.js"
 compatibility_date = "2026-09-12"
