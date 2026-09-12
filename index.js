@@ -1,36 +1,25 @@
-// ===========================================================
-// REPORTLI AI — CHAT TEST WORKER
-// ============================================================
-
 export default {
   async fetch(request, env) {
+    const url = new URL(request.url);
 
-    // --------------------------------------------------------
-    // CORS
-    // --------------------------------------------------------
-
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type"
+    // GET /
+    if (request.method === "GET" && url.pathname === "/") {
+      return new Response(
+        JSON.stringify({
+          success: true,
+          message: "Reportli Chat Worker is running"
+        }),
+        {
+          headers: {
+            "Content-Type": "application/json"
+          }
         }
-      });
+      );
     }
 
-    // --------------------------------------------------------
-    // TEST ROUTE
-    // --------------------------------------------------------
-
-    if (request.method === "POST" && new URL(request.url).pathname === "/chat") {
-
+    // POST /chat
+    if (request.method === "POST" && url.pathname === "/chat") {
       try {
-
-        // ----------------------------------------------------
-        // Read request body
-        // ----------------------------------------------------
-
         const body = await request.json();
 
         const {
@@ -39,10 +28,6 @@ export default {
           conversation_id,
           question
         } = body;
-
-        // ----------------------------------------------------
-        // Basic validation
-        // ----------------------------------------------------
 
         if (!user_id) {
           return json({
@@ -72,103 +57,37 @@ export default {
           }, 400);
         }
 
-        // ----------------------------------------------------
-        // Create test reply
-        // ----------------------------------------------------
-
         const reply =
-          "Test successful. Your question was saved to Reportli.";
-
-        // ----------------------------------------------------
-        // Insert into Supabase
-        // ----------------------------------------------------
-
-        const response = await fetch(
-          `${env.SUPABASE_URL}/rest/v1/chat_messages`,
-          {
-            method: "POST",
-
-            headers: {
-              "Content-Type": "application/json",
-              "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-              "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-              "Prefer": "return=representation"
-            },
-
-            body: JSON.stringify({
-              id: `msg_${crypto.randomUUID()}`,
-              user_id,
-              application_id,
-              conversation_id,
-              role: "AI",
-              question,
-              reply
-            })
-          }
-        );
-
-        // ----------------------------------------------------
-        // Supabase error
-        // ----------------------------------------------------
-
-        const responseText = await response.text();
-
-        if (!response.ok) {
-          return json({
-            success: false,
-            error: "Supabase insert failed",
-            details: responseText
-          }, 500);
-        }
-
-        // ----------------------------------------------------
-        // Success
-        // ----------------------------------------------------
-
-        let savedMessage;
-
-        try {
-          savedMessage = JSON.parse(responseText);
-        } catch {
-          savedMessage = responseText;
-        }
+          "Test successful. Your question was received by Reportli.";
 
         return json({
           success: true,
-          message: savedMessage
+          message: {
+            user_id,
+            application_id,
+            conversation_id,
+            role: "AI",
+            question,
+            reply
+          }
         });
 
       } catch (error) {
-
         return json({
           success: false,
           error: error.message
-        }, 500);
+        }, 400);
       }
-    }
-
-    // --------------------------------------------------------
-    // Health check
-    // --------------------------------------------------------
-
-    if (request.method === "GET") {
-      return json({
-        success: true,
-        message: "Reportli Chat Worker is running"
-      });
     }
 
     return json({
       success: false,
-      error: "Method not allowed"
+      error: "Method not allowed",
+      method: request.method,
+      path: url.pathname
     }, 405);
   }
 };
-
-
-// ============================================================
-// JSON RESPONSE HELPER
-// ============================================================
 
 function json(data, status = 200) {
   return new Response(
@@ -181,4 +100,4 @@ function json(data, status = 200) {
       }
     }
   );
-            }
+}
