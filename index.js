@@ -1,51 +1,49 @@
-// ============================================================
-// REPORTLI AI — CHAT WORKER
-// ============================================================
-
 export default {
   async fetch(request, env) {
 
-    // --------------------------------------------------------
+    // ========================================================
     // CORS
-    // --------------------------------------------------------
+    // ========================================================
 
     if (request.method === "OPTIONS") {
       return new Response(null, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type"
-        }
+        status: 204,
+        headers: corsHeaders()
       });
     }
 
-    // --------------------------------------------------------
+
+    // ========================================================
     // URL
-    // --------------------------------------------------------
+    // ========================================================
 
     const url = new URL(request.url);
 
-    // --------------------------------------------------------
+
+    // ========================================================
     // HEALTH CHECK
-    // --------------------------------------------------------
+    // ========================================================
 
     if (request.method === "GET" && url.pathname === "/") {
+
       return json({
         success: true,
         message: "Reportli Chat Worker is running"
       });
+
     }
 
-    // --------------------------------------------------------
-    // CHAT ROUTE
-    // --------------------------------------------------------
+
+    // ========================================================
+    // CHAT
+    // ========================================================
 
     if (request.method === "POST" && url.pathname === "/chat") {
 
       try {
 
         // ----------------------------------------------------
-        // READ REQUEST
+        // Read request
         // ----------------------------------------------------
 
         const body = await request.json();
@@ -57,8 +55,9 @@ export default {
           question
         } = body;
 
+
         // ----------------------------------------------------
-        // VALIDATION
+        // Validate request
         // ----------------------------------------------------
 
         if (!user_id) {
@@ -82,29 +81,36 @@ export default {
           }, 400);
         }
 
-        if (!question) {
+        if (!question || !question.trim()) {
           return json({
             success: false,
             error: "question is required"
           }, 400);
         }
 
+
+        // ====================================================
+        // GENERATE AI REPLY
+        // ====================================================
+
         // ----------------------------------------------------
-        // TEST AI REPLY
+        // TEMPORARY TEST REPLY
         // ----------------------------------------------------
+        //
+        // Replace this section with your actual AI call later.
+        //
 
         const reply =
-          "Test successful. Your question was saved to Reportli.";
+          `I received your question: "${question.trim()}"`;
 
-        // ----------------------------------------------------
-        // CREATE MESSAGE ID
-        // ----------------------------------------------------
 
-        const messageId = `msg_${crypto.randomUUID()}`;
+        // ====================================================
+        // SAVE AI REPLY TO SUPABASE
+        // ====================================================
 
-        // ----------------------------------------------------
-        // INSERT INTO SUPABASE
-        // ----------------------------------------------------
+        const messageId =
+          `msg_${crypto.randomUUID()}`;
+
 
         const supabaseResponse = await fetch(
           `${env.SUPABASE_URL}/rest/v1/chat_messages`,
@@ -114,114 +120,202 @@ export default {
             headers: {
               "Content-Type": "application/json",
 
-              // Supabase API key
-              "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+              "apikey":
+                env.SUPABASE_SERVICE_ROLE_KEY,
 
-              // Authorization
               "Authorization":
                 `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
 
-              // Ask Supabase to return the inserted row
-              "Prefer": "return=representation"
+              "Prefer":
+                "return=representation"
             },
 
             body: JSON.stringify({
+
+              // ------------------------------------------------
+              // Message information
+              // ------------------------------------------------
+
               id: messageId,
+
               user_id: user_id,
+
               application_id: application_id,
+
               conversation_id: conversation_id,
+
+              // ------------------------------------------------
+              // This is an AI message
+              // ------------------------------------------------
+
               role: "AI",
-              question: question,
+
+              // ------------------------------------------------
+              // IMPORTANT:
+              //
+              // The frontend already saved the question.
+              // Therefore the Worker does NOT save question.
+              // ------------------------------------------------
+
+              question: null,
+
+              // ------------------------------------------------
+              // Save only the AI reply
+              // ------------------------------------------------
+
               reply: reply
+
             })
           }
         );
 
-        // ----------------------------------------------------
-        // READ SUPABASE RESPONSE
-        // ----------------------------------------------------
+
+        // ====================================================
+        // SUPABASE RESPONSE
+        // ====================================================
 
         const supabaseText =
           await supabaseResponse.text();
 
-        // ----------------------------------------------------
+
+        // ====================================================
         // SUPABASE ERROR
-        // ----------------------------------------------------
+        // ====================================================
 
         if (!supabaseResponse.ok) {
 
           return json({
+
             success: false,
-            error: "Supabase insert failed",
-            supabase_status: supabaseResponse.status,
-            details: supabaseText
+
+            error: "Failed to save AI reply to Supabase",
+
+            supabase_status:
+              supabaseResponse.status,
+
+            details:
+              supabaseText
+
           }, 500);
+
         }
 
-        // ----------------------------------------------------
+
+        // ====================================================
         // PARSE SAVED MESSAGE
-        // ----------------------------------------------------
+        // ====================================================
 
         let savedMessage;
 
         try {
-          savedMessage = JSON.parse(supabaseText);
+
+          savedMessage =
+            JSON.parse(supabaseText);
+
         } catch {
-          savedMessage = supabaseText;
+
+          savedMessage =
+            supabaseText;
+
         }
 
-        // ----------------------------------------------------
-        // SUCCESS
-        // ----------------------------------------------------
+
+        // ====================================================
+        // RETURN REPLY TO FRONTEND
+        // ====================================================
 
         return json({
+
           success: true,
+
+          reply: reply,
+
           message: savedMessage
+
         });
+
 
       } catch (error) {
 
-        // ----------------------------------------------------
-        // WORKER ERROR
-        // ----------------------------------------------------
+        // ====================================================
+        // GENERAL ERROR
+        // ====================================================
 
         return json({
+
           success: false,
-          error: error.message
+
+          error: error.message || "Unknown error"
+
         }, 500);
+
       }
+
     }
 
-    // --------------------------------------------------------
+
+    // ========================================================
     // UNKNOWN ROUTE
-    // --------------------------------------------------------
+    // ========================================================
 
     return json({
+
       success: false,
+
       error: "Method not allowed",
+
       method: request.method,
+
       path: url.pathname
+
     }, 405);
+
   }
 };
 
 
 // ============================================================
-// JSON RESPONSE HELPER
+// CORS HEADERS
+// ============================================================
+
+function corsHeaders() {
+
+  return {
+
+    "Access-Control-Allow-Origin": "*",
+
+    "Access-Control-Allow-Methods":
+      "GET, POST, OPTIONS",
+
+    "Access-Control-Allow-Headers":
+      "Content-Type",
+
+    "Content-Type":
+      "application/json"
+
+  };
+
+}
+
+
+// ============================================================
+// JSON RESPONSE
 // ============================================================
 
 function json(data, status = 200) {
 
   return new Response(
+
     JSON.stringify(data),
 
     {
+
       status: status,
 
-      headers: {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*"
-      }
+      headers: corsHeaders()
+
     }
+
   );
-                    }
+
+    }
