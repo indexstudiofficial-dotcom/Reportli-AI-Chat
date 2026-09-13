@@ -1,34 +1,56 @@
 // ============================================================
-// REPORTLI AI - CHAT WORKER
+// REPORTLI AI - INTELLIGENT CHAT WORKER
 // ============================================================
-// Purpose:
-// - Receives founder questions
-// - Reads SaaS activity + errors from Supabase
-// - Analyzes the last 7 days
-// - Uses Sarvam-105B
-// - Saves the AI reply into chat_messages
 //
-// Current MVP scope:
-// ✅ Sessions
-// ✅ Events
-// ✅ Errors
-// ✅ Last 7 days
-// ❌ Gmail
-// ❌ Threads
-// ❌ Stripe
-// ❌ GitHub
-// ❌ Customer identity
-// ❌ Revenue
+// FLOW:
 //
-// Required Cloudflare Worker secrets:
+// User question
+//      ↓
+// Cloudflare Worker
+//      ↓
+// SARVAM 105B - PLANNER
+//      ↓
+// Understand question
+//      ↓
+// Select required tables + columns
+//      ↓
+// Worker validates AI plan
+//      ↓
+// Supabase
+//      ↓
+// Relevant data
+//      ↓
+// SARVAM 105B - ANALYST
+//      ↓
+// Final answer
+//      ↓
+// Save answer to chat_messages
+//      ↓
+// Return answer
+//
+// ============================================================
+//
+// CURRENT DATA:
+//
+// chat_messages
+// user_activity
+// errors
+//
+// CURRENT ANALYTICS WINDOW:
+//
+// Last 7 days
+//
+// REQUIRED CLOUDFLARE SECRETS:
+//
 // SUPABASE_URL
 // SUPABASE_SERVICE_ROLE_KEY
 // SARVAM_API_KEY
+//
 // ============================================================
 
 
 // ============================================================
-// CONFIG
+// CONFIGURATION
 // ============================================================
 
 const SARVAM_URL =
@@ -37,18 +59,77 @@ const SARVAM_URL =
 const SARVAM_MODEL =
   "sarvam-105b";
 
+const MAX_ROWS_PER_TABLE =
+  5000;
+
+
+// ============================================================
+// ALLOWED DATABASE SCHEMA
+// ============================================================
+//
+// IMPORTANT:
+//
+// Sarvam can ONLY choose from these tables and columns.
+//
+// Never allow the AI to generate arbitrary SQL.
+//
+// ============================================================
+
+const DATABASE_SCHEMA = {
+
+  chat_messages: [
+    "id",
+    "user_id",
+    "application_id",
+    "conversation_id",
+    "role",
+    "question",
+    "reply",
+    "created_at",
+  ],
+
+  user_activity: [
+    "id",
+    "user_id",
+    "session_id",
+    "time",
+    "event",
+    "api_key",
+  ],
+
+  errors: [
+    "id",
+    "api_key",
+    "error_message",
+    "timestamp",
+    "ai_analysis",
+    "user_id",
+  ],
+
+};
+
 
 // ============================================================
 // CORS
 // ============================================================
 
 function corsHeaders() {
+
   return {
+
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    "Content-Type": "application/json",
+
+    "Access-Control-Allow-Methods":
+      "GET, POST, OPTIONS",
+
+    "Access-Control-Allow-Headers":
+      "Content-Type, Authorization",
+
+    "Content-Type":
+      "application/json",
+
   };
+
 }
 
 
@@ -57,82 +138,43 @@ function corsHeaders() {
 // ============================================================
 
 function json(data, status = 200) {
+
   return new Response(
+
     JSON.stringify(data),
+
     {
       status,
-      headers: corsHeaders(),
+
+      headers:
+        corsHeaders(),
     }
+
   );
+
 }
 
 
 // ============================================================
-// NORMALIZE EVENT
-// ============================================================
-
-function normalizeEvent(event) {
-  if (event === null || event === undefined) {
-    return "unknown";
-  }
-
-  // If event is already a string
-  if (typeof event === "string") {
-    return event;
-  }
-
-  // If event is an object
-  if (typeof event === "object") {
-    if (typeof event.name === "string") {
-      return event.name;
-    }
-
-    if (typeof event.event === "string") {
-      return event.event;
-    }
-
-    if (typeof event.type === "string") {
-      return event.type;
-    }
-
-    // Fallback
-    try {
-      return JSON.stringify(event);
-    } catch {
-      return "unknown";
-    }
-  }
-
-  return String(event);
-}
-
-
-// ============================================================
-// DATE HELPERS
+// DATE
 // ============================================================
 
 function getSevenDaysAgo() {
-  const date = new Date();
 
-  date.setUTCDate(date.getUTCDate() - 7);
+  const date =
+    new Date();
+
+  date.setUTCDate(
+    date.getUTCDate() - 7
+  );
 
   return date.toISOString();
-}
 
-
-function getDayKey(dateValue) {
-  const date = new Date(dateValue);
-
-  if (Number.isNaN(date.getTime())) {
-    return "unknown";
-  }
-
-  return date.toISOString().slice(0, 10);
 }
 
 
 // ============================================================
-// SUPABASE REQUEST HELPER
+// SUPABASE REQUEST
 // ============================================================
 
 async function supabaseRequest(
@@ -140,46 +182,1247 @@ async function supabaseRequest(
   path,
   options = {}
 ) {
+
   const url =
     `${env.SUPABASE_URL}${path}`;
 
   const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+
+    "apikey":
+      env.SUPABASE_SERVICE_ROLE_KEY,
+
     "Authorization":
       `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
+
+    "Content-Type":
+      "application/json",
+
     ...(options.headers || {}),
+
   };
 
-  const response = await fetch(
-    url,
-    {
-      ...options,
-      headers,
-    }
-  );
 
-  const text = await response.text();
+  const response =
+    await fetch(
+
+      url,
+
+      {
+        ...options,
+        headers,
+      }
+
+    );
+
+
+  const text =
+    await response.text();
+
 
   let data;
 
   try {
-    data = text ? JSON.parse(text) : null;
+
+    data =
+      text
+        ? JSON.parse(text)
+        : null;
+
   } catch {
-    data = text;
+
+    data =
+      text;
+
   }
 
+
   if (!response.ok) {
+
     throw new Error(
+
       `Supabase HTTP ${response.status}: ${
         typeof data === "string"
           ? data
           : JSON.stringify(data)
       }`
+
     );
+
   }
 
+
   return data;
+
+}
+
+
+// ============================================================
+// SARVAM REQUEST
+// ============================================================
+
+async function sarvamRequest(
+  env,
+  messages,
+  options = {}
+) {
+
+  if (!env.SARVAM_API_KEY) {
+
+    throw new Error(
+      "SARVAM_API_KEY is missing."
+    );
+
+  }
+
+
+  const body = {
+
+    model:
+      SARVAM_MODEL,
+
+    messages,
+
+    temperature:
+      options.temperature ?? 0.1,
+
+    max_tokens:
+      options.max_tokens ?? 3000,
+
+    reasoning_effort:
+      options.reasoning_effort ?? "medium",
+
+    stream:
+      false,
+
+  };
+
+
+  // ----------------------------------------------------------
+  // Structured output
+  // ----------------------------------------------------------
+
+  if (options.response_format) {
+
+    body.response_format =
+      options.response_format;
+
+  }
+
+
+  const response =
+    await fetch(
+
+      SARVAM_URL,
+
+      {
+
+        method:
+          "POST",
+
+        headers: {
+
+          "Content-Type":
+            "application/json",
+
+          "api-subscription-key":
+            env.SARVAM_API_KEY,
+
+          "Authorization":
+            `Bearer ${env.SARVAM_API_KEY}`,
+
+        },
+
+        body:
+          JSON.stringify(body),
+
+      }
+
+    );
+
+
+  const text =
+    await response.text();
+
+
+  let data;
+
+  try {
+
+    data =
+      text
+        ? JSON.parse(text)
+        : null;
+
+  } catch {
+
+    data =
+      text;
+
+  }
+
+
+  if (!response.ok) {
+
+    console.error(
+      "SARVAM ERROR:",
+      JSON.stringify({
+        status:
+          response.status,
+
+        body:
+          data,
+      })
+    );
+
+
+    throw new Error(
+
+      `Sarvam API HTTP ${response.status}: ${
+        typeof data === "string"
+          ? data
+          : JSON.stringify(data)
+      }`
+
+    );
+
+  }
+
+
+  const content =
+    data?.choices?.[0]?.message?.content;
+
+
+  if (
+    typeof content !== "string" ||
+    !content.trim()
+  ) {
+
+    throw new Error(
+
+      `Sarvam returned no content: ${JSON.stringify(data)}`
+
+    );
+
+  }
+
+
+  return content.trim();
+
+}
+
+
+// ============================================================
+// EXTRACT JSON
+// ============================================================
+//
+// Safety fallback in case the model returns JSON wrapped
+// inside markdown despite response_format.
+//
+// ============================================================
+
+function extractJSON(text) {
+
+  if (
+    typeof text !== "string"
+  ) {
+
+    throw new Error(
+      "Expected JSON text from Sarvam."
+    );
+
+  }
+
+
+  // Direct JSON
+  try {
+
+    return JSON.parse(
+      text
+    );
+
+  } catch {}
+
+
+  // Remove markdown fences
+  const cleaned =
+    text
+      .replace(
+        /^```json\s*/i,
+        ""
+      )
+      .replace(
+        /^```\s*/i,
+        ""
+      )
+      .replace(
+        /\s*```$/i,
+        ""
+      )
+      .trim();
+
+
+  try {
+
+    return JSON.parse(
+      cleaned
+    );
+
+  } catch {}
+
+
+  throw new Error(
+    `Sarvam returned invalid JSON: ${text}`
+  );
+
+}
+
+
+// ============================================================
+// VALIDATE TABLE
+// ============================================================
+
+function isAllowedTable(
+  table
+) {
+
+  return Object.prototype
+    .hasOwnProperty.call(
+      DATABASE_SCHEMA,
+      table
+    );
+
+}
+
+
+// ============================================================
+// VALIDATE COLUMN
+// ============================================================
+
+function isAllowedColumn(
+  table,
+  column
+) {
+
+  if (
+    !isAllowedTable(table)
+  ) {
+
+    return false;
+
+  }
+
+
+  return DATABASE_SCHEMA[table]
+    .includes(column);
+
+}
+
+
+// ============================================================
+// VALIDATE SARVAM PLAN
+// ============================================================
+
+function validatePlan(
+  plan
+) {
+
+  if (
+    !plan ||
+    typeof plan !== "object"
+  ) {
+
+    throw new Error(
+      "Invalid Sarvam data plan."
+    );
+
+  }
+
+
+  if (
+    plan.type !== "data_query" &&
+    plan.type !== "conversation_query" &&
+    plan.type !== "general"
+  ) {
+
+    throw new Error(
+      "Sarvam returned an unsupported plan type."
+    );
+
+  }
+
+
+  // General question needs no database
+  if (
+    plan.type === "general"
+  ) {
+
+    return {
+      type:
+        "general",
+
+      tables: [],
+
+      time_range:
+        "last_7_days",
+    };
+
+  }
+
+
+  if (
+    !Array.isArray(plan.tables)
+  ) {
+
+    throw new Error(
+      "Sarvam plan does not contain tables."
+    );
+
+  }
+
+
+  const validatedTables = [];
+
+
+  for (
+    const tablePlan
+    of plan.tables
+  ) {
+
+    const table =
+      tablePlan?.table;
+
+
+    if (
+      !isAllowedTable(table)
+    ) {
+
+      throw new Error(
+        `Sarvam requested forbidden table: ${table}`
+      );
+
+    }
+
+
+    if (
+      !Array.isArray(
+        tablePlan.columns
+      )
+    ) {
+
+      throw new Error(
+        `No columns provided for ${table}.`
+      );
+
+    }
+
+
+    const columns = [];
+
+
+    for (
+      const column
+      of tablePlan.columns
+    ) {
+
+      if (
+        !isAllowedColumn(
+          table,
+          column
+        )
+      ) {
+
+        throw new Error(
+          `Sarvam requested forbidden column: ${table}.${column}`
+        );
+
+      }
+
+
+      if (
+        !columns.includes(column)
+      ) {
+
+        columns.push(column);
+
+      }
+
+    }
+
+
+    if (
+      columns.length === 0
+    ) {
+
+      throw new Error(
+        `No valid columns requested for ${table}.`
+      );
+
+    }
+
+
+    validatedTables.push({
+
+      table,
+
+      columns,
+
+    });
+
+  }
+
+
+  return {
+
+    type:
+      plan.type,
+
+    tables:
+      validatedTables,
+
+    time_range:
+      plan.time_range ===
+      "last_7_days"
+
+        ? "last_7_days"
+
+        : "last_7_days",
+
+  };
+
+}
+
+
+// ============================================================
+// SARVAM PLANNER
+// ============================================================
+//
+// This is the FIRST AI call.
+//
+// Sarvam understands the founder's question and decides
+// which data is necessary.
+//
+// ============================================================
+
+async function createDataPlan(
+  env,
+  question
+) {
+
+  const schemaText = `
+
+TABLE: chat_messages
+
+COLUMNS:
+${DATABASE_SCHEMA.chat_messages.join(", ")}
+
+
+TABLE: user_activity
+
+COLUMNS:
+${DATABASE_SCHEMA.user_activity.join(", ")}
+
+
+TABLE: errors
+
+COLUMNS:
+${DATABASE_SCHEMA.errors.join(", ")}
+
+`;
+
+
+  const systemPrompt = `
+
+You are the DATA PLANNER for Reportli AI.
+
+Reportli AI is an AI co-founder for SaaS founders.
+
+Your job is NOT to answer the founder's question.
+
+Your job is to understand the question and determine exactly which database tables and columns are required to answer it.
+
+AVAILABLE DATABASE SCHEMA:
+
+${schemaText}
+
+IMPORTANT RULES:
+
+1. You may ONLY choose tables listed in the schema.
+
+2. You may ONLY choose columns listed for those tables.
+
+3. NEVER invent a table.
+
+4. NEVER invent a column.
+
+5. NEVER generate SQL.
+
+6. NEVER generate a Supabase URL.
+
+7. NEVER request a secret, API key or password.
+
+8. Analytics data is limited to the LAST 7 DAYS.
+
+9. The user_activity table contains SaaS activity.
+
+10. user_activity.session_id represents a session.
+
+11. user_activity.event contains event information as JSONB.
+
+12. errors contains SaaS error information.
+
+13. chat_messages contains the founder's previous Reportli conversations.
+
+14. Do NOT use chat_messages for SaaS activity unless the founder specifically asks about previous Reportli conversations.
+
+15. Do NOT assume session_id equals a unique customer/user.
+
+16. Do NOT request user_activity.user_id to identify customers. It is not reliable customer identity for analytics.
+
+17. Request the minimum columns necessary.
+
+EXAMPLES:
+
+Question:
+"How many sessions did I have?"
+
+Plan:
+user_activity.session_id
+user_activity.time
+
+Question:
+"What events happened most frequently?"
+
+Plan:
+user_activity.event
+user_activity.time
+
+Question:
+"What is my most common error?"
+
+Plan:
+errors.error_message
+errors.timestamp
+
+Question:
+"When did errors increase?"
+
+Plan:
+errors.error_message
+errors.timestamp
+
+Question:
+"Give me a summary of what happened in my SaaS."
+
+Plan:
+user_activity.session_id
+user_activity.time
+user_activity.event
+
+AND
+
+errors.error_message
+errors.timestamp
+errors.ai_analysis
+
+Question:
+"What did I ask Reportli yesterday?"
+
+Plan:
+chat_messages.question
+chat_messages.reply
+chat_messages.created_at
+chat_messages.role
+
+If no database data is required, return type "general".
+
+Always return ONLY the requested JSON structure.
+
+`;
+
+
+  const userPrompt = `
+
+Founder question:
+
+${question}
+
+Determine the minimum database data required to answer this question.
+
+Return only a data plan.
+
+`;
+
+
+  const response =
+    await sarvamRequest(
+
+      env,
+
+      [
+
+        {
+          role:
+            "system",
+
+          content:
+            systemPrompt,
+
+        },
+
+        {
+          role:
+            "user",
+
+          content:
+            userPrompt,
+
+        },
+
+      ],
+
+      {
+
+        temperature:
+          0,
+
+        max_tokens:
+          1000,
+
+        reasoning_effort:
+          "medium",
+
+        response_format: {
+
+          type:
+            "json_schema",
+
+          json_schema: {
+
+            name:
+              "reportli_data_plan",
+
+            strict:
+              true,
+
+            schema: {
+
+              type:
+                "object",
+
+              properties: {
+
+                type: {
+
+                  type:
+                    "string",
+
+                  enum: [
+                    "data_query",
+                    "conversation_query",
+                    "general",
+                  ],
+
+                },
+
+                tables: {
+
+                  type:
+                    "array",
+
+                  items: {
+
+                    type:
+                      "object",
+
+                    properties: {
+
+                      table: {
+                        type:
+                          "string",
+                      },
+
+                      columns: {
+
+                        type:
+                          "array",
+
+                        items: {
+                          type:
+                            "string",
+                        },
+
+                      },
+
+                    },
+
+                    required: [
+                      "table",
+                      "columns",
+                    ],
+
+                    additionalProperties:
+                      false,
+
+                  },
+
+                },
+
+                time_range: {
+
+                  type:
+                    "string",
+
+                  enum: [
+                    "last_7_days",
+                  ],
+
+                },
+
+                reason: {
+
+                  type:
+                    "string",
+
+                },
+
+              },
+
+              required: [
+                "type",
+                "tables",
+                "time_range",
+                "reason",
+              ],
+
+              additionalProperties:
+                false,
+
+            },
+
+          },
+
+        },
+
+      }
+
+    );
+
+
+  const plan =
+    extractJSON(
+      response
+    );
+
+
+  return validatePlan(
+    plan
+  );
+
+}
+
+
+// ============================================================
+// SAFE COLUMN SELECT
+// ============================================================
+
+function buildSelect(
+  columns
+) {
+
+  return columns
+    .join(",");
+
+}
+
+
+// ============================================================
+// FETCH USER ACTIVITY
+// ============================================================
+
+async function fetchUserActivity(
+  env,
+  apiKey,
+  columns,
+  sevenDaysAgo
+) {
+
+  const select =
+    buildSelect(
+      columns
+    );
+
+
+  const path =
+    `/rest/v1/user_activity` +
+    `?api_key=eq.${encodeURIComponent(apiKey)}` +
+    `&time=gte.${encodeURIComponent(sevenDaysAgo)}` +
+    `&select=${encodeURIComponent(select)}` +
+    `&order=time.desc` +
+    `&limit=${MAX_ROWS_PER_TABLE}`;
+
+
+  return await supabaseRequest(
+    env,
+    path
+  );
+
+}
+
+
+// ============================================================
+// FETCH ERRORS
+// ============================================================
+
+async function fetchErrors(
+  env,
+  apiKey,
+  columns,
+  sevenDaysAgo
+) {
+
+  const select =
+    buildSelect(
+      columns
+    );
+
+
+  const path =
+    `/rest/v1/errors` +
+    `?api_key=eq.${encodeURIComponent(apiKey)}` +
+    `&timestamp=gte.${encodeURIComponent(sevenDaysAgo)}` +
+    `&select=${encodeURIComponent(select)}` +
+    `&order=timestamp.desc` +
+    `&limit=${MAX_ROWS_PER_TABLE}`;
+
+
+  return await supabaseRequest(
+    env,
+    path
+  );
+
+}
+
+
+// ============================================================
+// FETCH CHAT MESSAGES
+// ============================================================
+
+async function fetchChatMessages(
+  env,
+  userId,
+  applicationId,
+  columns
+) {
+
+  const select =
+    buildSelect(
+      columns
+    );
+
+
+  const path =
+    `/rest/v1/chat_messages` +
+    `?user_id=eq.${encodeURIComponent(userId)}` +
+    `&application_id=eq.${encodeURIComponent(applicationId)}` +
+    `&created_at=gte.${encodeURIComponent(getSevenDaysAgo())}` +
+    `&select=${encodeURIComponent(select)}` +
+    `&order=created_at.desc` +
+    `&limit=${MAX_ROWS_PER_TABLE}`;
+
+
+  return await supabaseRequest(
+    env,
+    path
+  );
+
+}
+
+
+// ============================================================
+// EXECUTE DATA PLAN
+// ============================================================
+//
+// Sarvam chooses what it needs.
+// Worker decides HOW to query it.
+//
+// ============================================================
+
+async function executeDataPlan(
+  env,
+  plan,
+  application,
+  userId,
+  applicationId
+) {
+
+  const sevenDaysAgo =
+    getSevenDaysAgo();
+
+
+  const result = {
+
+    period:
+      "last 7 days",
+
+    tables: {},
+
+  };
+
+
+  for (
+    const tablePlan
+    of plan.tables
+  ) {
+
+    const {
+      table,
+      columns,
+    } =
+      tablePlan;
+
+
+    // --------------------------------------------------------
+    // USER ACTIVITY
+    // --------------------------------------------------------
+
+    if (
+      table ===
+      "user_activity"
+    ) {
+
+      const rows =
+        await fetchUserActivity(
+
+          env,
+
+          application.api_key,
+
+          columns,
+
+          sevenDaysAgo
+
+        );
+
+
+      result.tables.user_activity = {
+
+        columns,
+
+        row_count:
+          rows.length,
+
+        rows,
+
+      };
+
+      continue;
+
+    }
+
+
+    // --------------------------------------------------------
+    // ERRORS
+    // --------------------------------------------------------
+
+    if (
+      table ===
+      "errors"
+    ) {
+
+      const rows =
+        await fetchErrors(
+
+          env,
+
+          application.api_key,
+
+          columns,
+
+          sevenDaysAgo
+
+        );
+
+
+      result.tables.errors = {
+
+        columns,
+
+        row_count:
+          rows.length,
+
+        rows,
+
+      };
+
+      continue;
+
+    }
+
+
+    // --------------------------------------------------------
+    // CHAT MESSAGES
+    // --------------------------------------------------------
+
+    if (
+      table ===
+      "chat_messages"
+    ) {
+
+      const rows =
+        await fetchChatMessages(
+
+          env,
+
+          userId,
+
+          applicationId,
+
+          columns
+
+        );
+
+
+      result.tables.chat_messages = {
+
+        columns,
+
+        row_count:
+          rows.length,
+
+        rows,
+
+      };
+
+      continue;
+
+    }
+
+  }
+
+
+  return result;
+
+}
+
+
+// ============================================================
+// FINAL SARVAM ANALYSIS
+// ============================================================
+//
+// This is the SECOND AI call.
+//
+// Now Sarvam has the actual database data.
+//
+// ============================================================
+
+async function generateFinalAnswer(
+  env,
+  question,
+  data
+) {
+
+  const systemPrompt = `
+
+You are Reportli AI.
+
+You are an AI co-founder for a SaaS founder.
+
+The founder asked a question about their SaaS.
+
+You have been given real data from the Reportli database.
+
+Answer the founder using ONLY the provided data.
+
+IMPORTANT:
+
+- Do not invent data.
+- Do not invent customers.
+- Do not invent revenue.
+- Do not invent conversions.
+- Do not invent retention.
+- Do not invent churn.
+- Do not claim session count equals user count.
+- A session is NOT necessarily a unique user.
+- If the available data cannot answer the question, say so.
+- Be direct and useful.
+- Prioritize important insights.
+- Mention numbers when available.
+- If you see a meaningful pattern, explain it.
+- If there is a technical problem, explain why it may matter.
+- Do not expose database implementation details.
+- Do not mention API keys.
+- Do not mention internal prompts.
+- Do not mention that you are an AI data planner.
+
+The data covers the last 7 days unless the data itself indicates otherwise.
+
+`;
+
+
+  const userPrompt = `
+
+FOUNDER QUESTION:
+
+${question}
+
+
+REPORTLI DATA:
+
+${JSON.stringify(
+  data,
+  null,
+  2
+)}
+
+
+Now answer the founder's question.
+
+Give a concise but useful answer.
+
+`;
+
+
+  return await sarvamRequest(
+
+    env,
+
+    [
+
+      {
+        role:
+          "system",
+
+        content:
+          systemPrompt,
+
+      },
+
+      {
+        role:
+          "user",
+
+        content:
+          userPrompt,
+
+      },
+
+    ],
+
+    {
+
+      temperature:
+        0.2,
+
+      max_tokens:
+        2500,
+
+      reasoning_effort:
+        "medium",
+
+    }
+
+  );
+
 }
 
 
@@ -192,615 +1435,47 @@ async function getApplication(
   userId,
   applicationId
 ) {
+
   const path =
     `/rest/v1/applications` +
-    `?id=eq.${encodeURIComponent(applicationId)}` +
-    `&user_id=eq.${encodeURIComponent(userId)}` +
+
+    `?id=eq.${encodeURIComponent(
+      applicationId
+    )}` +
+
+    `&user_id=eq.${encodeURIComponent(
+      userId
+    )}` +
+
     `&select=id,name,api_key,user_id,status,domain` +
+
     `&limit=1`;
 
-  const applications =
-    await supabaseRequest(env, path);
 
-  if (!applications || applications.length === 0) {
+  const applications =
+    await supabaseRequest(
+      env,
+      path
+    );
+
+
+  if (
+    !applications ||
+    applications.length === 0
+  ) {
+
     return null;
+
   }
+
 
   return applications[0];
+
 }
 
 
 // ============================================================
-// FETCH ACTIVITY
-// ============================================================
-
-async function getActivity(
-  env,
-  apiKey,
-  sevenDaysAgo
-) {
-  const path =
-    `/rest/v1/user_activity` +
-    `?api_key=eq.${encodeURIComponent(apiKey)}` +
-    `&time=gte.${encodeURIComponent(sevenDaysAgo)}` +
-    `&select=id,user_id,session_id,time,event,api_key` +
-    `&order=time.desc` +
-    `&limit=5000`;
-
-  return await supabaseRequest(
-    env,
-    path
-  );
-}
-
-
-// ============================================================
-// FETCH ERRORS
-// ============================================================
-
-async function getErrors(
-  env,
-  apiKey,
-  sevenDaysAgo
-) {
-  const path =
-    `/rest/v1/errors` +
-    `?api_key=eq.${encodeURIComponent(apiKey)}` +
-    `&timestamp=gte.${encodeURIComponent(sevenDaysAgo)}` +
-    `&select=id,api_key,error_message,timestamp,ai_analysis,user_id` +
-    `&order=timestamp.desc` +
-    `&limit=5000`;
-
-  return await supabaseRequest(
-    env,
-    path
-  );
-}
-
-
-// ============================================================
-// ACTIVITY ANALYSIS
-// ============================================================
-
-function analyzeActivity(activity) {
-
-  const sessions = new Set();
-
-  const eventCounts = {};
-
-  const dailySessions = {};
-
-  for (const row of activity) {
-
-    // ----------------------------------------
-    // Session
-    // ----------------------------------------
-
-    if (row.session_id) {
-      sessions.add(row.session_id);
-
-      const day =
-        getDayKey(row.time);
-
-      if (!dailySessions[day]) {
-        dailySessions[day] = new Set();
-      }
-
-      dailySessions[day].add(
-        row.session_id
-      );
-    }
-
-    // ----------------------------------------
-    // Event
-    // ----------------------------------------
-
-    const eventName =
-      normalizeEvent(row.event);
-
-    eventCounts[eventName] =
-      (eventCounts[eventName] || 0) + 1;
-  }
-
-
-  // Convert daily session Sets
-  // into numbers
-
-  const sessionsByDay = {};
-
-  for (
-    const [day, sessionSet]
-    of Object.entries(dailySessions)
-  ) {
-    sessionsByDay[day] =
-      sessionSet.size;
-  }
-
-
-  // ----------------------------------------
-  // Top events
-  // ----------------------------------------
-
-  const topEvents =
-    Object.entries(eventCounts)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 20)
-      .map(([event, count]) => ({
-        event,
-        count,
-      }));
-
-
-  // ----------------------------------------
-  // Most active day
-  // ----------------------------------------
-
-  let mostActiveDay = null;
-
-  for (
-    const [day, count]
-    of Object.entries(sessionsByDay)
-  ) {
-
-    if (
-      !mostActiveDay ||
-      count > mostActiveDay.sessions
-    ) {
-      mostActiveDay = {
-        day,
-        sessions: count,
-      };
-    }
-  }
-
-
-  return {
-    totalActivityRows: activity.length,
-
-    uniqueSessions: sessions.size,
-
-    sessionsByDay,
-
-    mostActiveDay,
-
-    topEvents,
-  };
-}
-
-
-// ============================================================
-// ERROR ANALYSIS
-// ============================================================
-
-function analyzeErrors(errors) {
-
-  const errorCounts = {};
-
-  const errorsByDay = {};
-
-  for (const error of errors) {
-
-    // ----------------------------------------
-    // Error name
-    // ----------------------------------------
-
-    const message =
-      typeof error.error_message === "string"
-        ? error.error_message.trim()
-        : "Unknown error";
-
-
-    errorCounts[message] =
-      (errorCounts[message] || 0) + 1;
-
-
-    // ----------------------------------------
-    // Day
-    // ----------------------------------------
-
-    const day =
-      getDayKey(error.timestamp);
-
-    errorsByDay[day] =
-      (errorsByDay[day] || 0) + 1;
-  }
-
-
-  // ----------------------------------------
-  // Top errors
-  // ----------------------------------------
-
-  const topErrors =
-    Object.entries(errorCounts)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 20)
-      .map(([error, count]) => ({
-        error,
-        count,
-      }));
-
-
-  // ----------------------------------------
-  // Worst day
-  // ----------------------------------------
-
-  let worstErrorDay = null;
-
-  for (
-    const [day, count]
-    of Object.entries(errorsByDay)
-  ) {
-
-    if (
-      !worstErrorDay ||
-      count > worstErrorDay.errors
-    ) {
-      worstErrorDay = {
-        day,
-        errors: count,
-      };
-    }
-  }
-
-
-  return {
-    totalErrors: errors.length,
-
-    errorsByDay,
-
-    worstErrorDay,
-
-    topErrors,
-  };
-}
-
-
-// ============================================================
-// INTENT DETECTION
-// ============================================================
-
-function detectIntent(question) {
-
-  const q =
-    question.toLowerCase();
-
-
-  const activityWords = [
-    "session",
-    "sessions",
-    "event",
-    "events",
-    "activity",
-    "active",
-    "doing",
-    "used",
-    "usage",
-    "most used",
-    "popular",
-    "day",
-    "days",
-    "7 day",
-    "7 days",
-    "week",
-    "weekly",
-    "happened",
-  ];
-
-
-  const errorWords = [
-    "error",
-    "errors",
-    "bug",
-    "bugs",
-    "failure",
-    "failed",
-    "crash",
-    "crashes",
-    "problem",
-    "problems",
-    "issue",
-    "issues",
-    "broken",
-    "fix",
-    "technical",
-  ];
-
-
-  const hasActivity =
-    activityWords.some(
-      word => q.includes(word)
-    );
-
-
-  const hasErrors =
-    errorWords.some(
-      word => q.includes(word)
-    );
-
-
-  // Both
-  if (
-    hasActivity &&
-    hasErrors
-  ) {
-    return "combined";
-  }
-
-
-  // Errors
-  if (hasErrors) {
-    return "errors";
-  }
-
-
-  // Activity
-  if (hasActivity) {
-    return "activity";
-  }
-
-
-  // General SaaS question
-  const generalWords = [
-    "what happened",
-    "summary",
-    "summarize",
-    "overview",
-    "insight",
-    "insights",
-    "what should",
-    "attention",
-    "important",
-    "biggest",
-  ];
-
-
-  if (
-    generalWords.some(
-      word => q.includes(word)
-    )
-  ) {
-    return "combined";
-  }
-
-
-  return "unsupported";
-}
-
-
-// ============================================================
-// SARVAM AI
-// ============================================================
-
-async function askSarvam(
-  env,
-  question,
-  context
-) {
-
-  if (!env.SARVAM_API_KEY) {
-    throw new Error(
-      "SARVAM_API_KEY is not configured in Cloudflare Worker secrets."
-    );
-  }
-
-
-  // ----------------------------------------
-  // System prompt
-  // ----------------------------------------
-
-  const systemPrompt = `
-You are Reportli AI.
-
-You are an AI co-founder for SaaS founders.
-
-Your job is to analyze the founder's SaaS activity data from the last 7 days and give useful, direct business and product insights.
-
-IMPORTANT DATA LIMITATIONS:
-
-- The data contains sessions, events and errors.
-- It does NOT contain reliable customer identity.
-- Do NOT claim how many unique customers/users there are.
-- Do NOT identify individual customers.
-- Do NOT invent revenue.
-- Do NOT invent conversions.
-- Do NOT invent retention.
-- Do NOT invent churn.
-- Do NOT invent data that is not provided.
-
-A session is NOT necessarily a unique user.
-
-When talking about activity, use:
-- sessions
-- events
-- activity
-
-When talking about technical problems, use:
-- errors
-- error frequency
-- error trends
-
-Your answer should be useful to a SaaS founder.
-
-Do not simply dump raw data.
-
-Find patterns.
-
-Prioritize important problems.
-
-If there is a clear issue, explain:
-1. What happened
-2. Evidence
-3. Why it matters
-4. What the founder should investigate or fix
-
-Be concise.
-
-Use simple formatting.
-
-Do not mention internal implementation details unless useful.
-
-The current data window is the last 7 days.
-`;
-
-
-  // ----------------------------------------
-  // User prompt
-  // ----------------------------------------
-
-  const userPrompt = `
-Founder question:
-
-${question}
-
-Here is the Reportli data from the last 7 days:
-
-${JSON.stringify(
-  context,
-  null,
-  2
-)}
-
-Answer the founder's question using ONLY the supplied data.
-
-If the data is insufficient to answer something, say that clearly.
-
-Do not make up data.
-`;
-
-
-  // ----------------------------------------
-  // Sarvam request
-  // ----------------------------------------
-
-  const body = {
-    model: SARVAM_MODEL,
-
-    messages: [
-      {
-        role: "system",
-        content: systemPrompt,
-      },
-      {
-        role: "user",
-        content: userPrompt,
-      },
-    ],
-
-    temperature: 0.2,
-
-    max_tokens: 1200,
-
-    reasoning_effort: "medium",
-
-    stream: false,
-
-    n: 1,
-  };
-
-
-  const response =
-    await fetch(
-      SARVAM_URL,
-      {
-        method: "POST",
-
-        headers: {
-          "Content-Type":
-            "application/json",
-
-          "api-subscription-key":
-            env.SARVAM_API_KEY,
-
-          // Also send Bearer auth.
-          // Sarvam supports Bearer authentication
-          // for this endpoint.
-          "Authorization":
-            `Bearer ${env.SARVAM_API_KEY}`,
-        },
-
-        body: JSON.stringify(body),
-      }
-    );
-
-
-  const responseText =
-    await response.text();
-
-
-  // ----------------------------------------
-  // IMPORTANT:
-  // Don't hide Sarvam's real error.
-  // ----------------------------------------
-
-  if (!response.ok) {
-
-    let errorData;
-
-    try {
-      errorData =
-        JSON.parse(responseText);
-    } catch {
-      errorData =
-        responseText;
-    }
-
-
-    console.error(
-      "SARVAM API ERROR:",
-      JSON.stringify({
-        status: response.status,
-        statusText: response.statusText,
-        error: errorData,
-      })
-    );
-
-
-    throw new Error(
-      `Sarvam API HTTP ${response.status}: ${
-        typeof errorData === "string"
-          ? errorData
-          : JSON.stringify(errorData)
-      }`
-    );
-  }
-
-
-  // ----------------------------------------
-  // Parse response
-  // ----------------------------------------
-
-  let data;
-
-  try {
-    data =
-      JSON.parse(responseText);
-  } catch {
-    throw new Error(
-      "Sarvam returned invalid JSON."
-    );
-  }
-
-
-  const reply =
-    data?.choices?.[0]?.message?.content;
-
-
-  if (
-    !reply ||
-    typeof reply !== "string"
-  ) {
-    throw new Error(
-      `Sarvam returned no assistant content: ${JSON.stringify(data)}`
-    );
-  }
-
-
-  return reply.trim();
-}
-
-
-// ============================================================
-// SAVE REPLY TO CHAT MESSAGE
+// SAVE CHAT REPLY
 // ============================================================
 
 async function saveReply(
@@ -814,18 +1489,32 @@ async function saveReply(
   }
 ) {
 
-  // Find the question row that the frontend
-  // created before calling the Worker.
-
   const searchPath =
+
     `/rest/v1/chat_messages` +
-    `?user_id=eq.${encodeURIComponent(userId)}` +
-    `&application_id=eq.${encodeURIComponent(applicationId)}` +
-    `&conversation_id=eq.${encodeURIComponent(conversationId)}` +
-    `&question=eq.${encodeURIComponent(question)}` +
+
+    `?user_id=eq.${encodeURIComponent(
+      userId
+    )}` +
+
+    `&application_id=eq.${encodeURIComponent(
+      applicationId
+    )}` +
+
+    `&conversation_id=eq.${encodeURIComponent(
+      conversationId
+    )}` +
+
+    `&question=eq.${encodeURIComponent(
+      question
+    )}` +
+
     `&reply=is.null` +
+
     `&select=id` +
+
     `&order=created_at.desc` +
+
     `&limit=1`;
 
 
@@ -840,11 +1529,13 @@ async function saveReply(
     !rows ||
     rows.length === 0
   ) {
+
     console.warn(
       "No matching chat_messages row found."
     );
 
     return null;
+
   }
 
 
@@ -853,84 +1544,44 @@ async function saveReply(
 
 
   const updatePath =
+
     `/rest/v1/chat_messages` +
-    `?id=eq.${encodeURIComponent(messageId)}`;
+
+    `?id=eq.${encodeURIComponent(
+      messageId
+    )}`;
 
 
   await supabaseRequest(
+
     env,
+
     updatePath,
+
     {
-      method: "PATCH",
+
+      method:
+        "PATCH",
 
       headers: {
-        "Prefer": "return=minimal",
+
+        "Prefer":
+          "return=minimal",
+
       },
 
-      body: JSON.stringify({
-        reply,
-      }),
+      body:
+        JSON.stringify({
+          reply,
+        }),
+
     }
+
   );
 
 
   return messageId;
-}
 
-
-// ============================================================
-// BUILD CONTEXT
-// ============================================================
-
-function buildContext(
-  activity,
-  errors
-) {
-
-  const activityAnalysis =
-    analyzeActivity(activity);
-
-
-  const errorAnalysis =
-    analyzeErrors(errors);
-
-
-  return {
-
-    period:
-      "last 7 days",
-
-    activity: {
-      rows:
-        activityAnalysis.totalActivityRows,
-
-      uniqueSessions:
-        activityAnalysis.uniqueSessions,
-
-      sessionsByDay:
-        activityAnalysis.sessionsByDay,
-
-      mostActiveDay:
-        activityAnalysis.mostActiveDay,
-
-      topEvents:
-        activityAnalysis.topEvents,
-    },
-
-    errors: {
-      total:
-        errorAnalysis.totalErrors,
-
-      errorsByDay:
-        errorAnalysis.errorsByDay,
-
-      worstErrorDay:
-        errorAnalysis.worstErrorDay,
-
-      topErrors:
-        errorAnalysis.topErrors,
-    },
-  };
 }
 
 
@@ -943,23 +1594,30 @@ async function handleChat(
   env
 ) {
 
-  // ----------------------------------------
-  // Parse request
-  // ----------------------------------------
+  // ----------------------------------------------------------
+  // Parse body
+  // ----------------------------------------------------------
 
   let body;
 
   try {
+
     body =
       await request.json();
+
   } catch {
+
     return json(
+
       {
         error:
           "Invalid JSON request body.",
       },
+
       400
+
     );
+
   }
 
 
@@ -971,9 +1629,9 @@ async function handleChat(
   } = body;
 
 
-  // ----------------------------------------
-  // Validate
-  // ----------------------------------------
+  // ----------------------------------------------------------
+  // Validate input
+  // ----------------------------------------------------------
 
   if (
     !user_id ||
@@ -983,12 +1641,16 @@ async function handleChat(
   ) {
 
     return json(
+
       {
         error:
           "Missing user_id, application_id, conversation_id or question.",
       },
+
       400
+
     );
+
   }
 
 
@@ -998,36 +1660,52 @@ async function handleChat(
   ) {
 
     return json(
+
       {
         error:
           "Question must be a non-empty string.",
       },
+
       400
+
     );
+
   }
 
 
-  // ----------------------------------------
-  // Find application
-  // ----------------------------------------
+  const cleanQuestion =
+    question.trim();
+
+
+  // ----------------------------------------------------------
+  // Validate application
+  // ----------------------------------------------------------
 
   const application =
     await getApplication(
+
       env,
+
       user_id,
+
       application_id
+
     );
 
 
   if (!application) {
 
     return json(
+
       {
         error:
           "Application not found or does not belong to this user.",
       },
+
       404
+
     );
+
   }
 
 
@@ -1036,187 +1714,330 @@ async function handleChat(
   ) {
 
     return json(
+
       {
         error:
           "Application does not have an API key.",
       },
+
       400
+
     );
+
   }
 
 
-  // ----------------------------------------
-  // Detect intent
-  // ----------------------------------------
+  // ==========================================================
+  // STEP 1
+  // SARVAM UNDERSTANDS THE QUESTION
+  // ==========================================================
 
-  const intent =
-    detectIntent(
-      question
+  let plan;
+
+  try {
+
+    plan =
+      await createDataPlan(
+
+        env,
+
+        cleanQuestion
+
+      );
+
+  } catch (error) {
+
+    console.error(
+      "SARVAM PLANNER ERROR:",
+      error
     );
 
+
+    return json(
+
+      {
+        error:
+          "Reportli could not understand the question.",
+
+        details:
+          error?.message ||
+          "Unknown planner error.",
+
+        model:
+          SARVAM_MODEL,
+
+      },
+
+      502
+
+    );
+
+  }
+
+
+  // ==========================================================
+  // STEP 2
+  // GENERAL QUESTION
+  // ==========================================================
 
   if (
-    intent === "unsupported"
+    plan.type ===
+    "general"
   ) {
 
-    const reply =
-      `I can currently analyze your SaaS sessions, events, and errors from the last 7 days.\n\nTry asking:\n\n• How many sessions did I have?\n• What are people doing in my app?\n• Which events are most common?\n• Which day had the most activity?\n• How many errors happened?\n• What is my most common error?\n• What are the biggest problems right now?\n• Give me a 7-day summary.`;
+    let reply;
+
+    try {
+
+      reply =
+        await generateFinalAnswer(
+
+          env,
+
+          cleanQuestion,
+
+          {
+            period:
+              "last 7 days",
+
+            tables: {},
+
+          }
+
+        );
+
+    } catch (error) {
+
+      console.error(
+        "SARVAM FINAL ERROR:",
+        error
+      );
 
 
-    await saveReply(
-      env,
-      {
-        userId: user_id,
-        applicationId: application_id,
-        conversationId: conversation_id,
-        question,
-        reply,
-      }
-    );
+      return json(
+
+        {
+          error:
+            "Reportli AI failed to generate an answer.",
+
+          details:
+            error?.message,
+
+          model:
+            SARVAM_MODEL,
+
+        },
+
+        502
+
+      );
+
+    }
+
+
+    try {
+
+      await saveReply(
+
+        env,
+
+        {
+          userId:
+            user_id,
+
+          applicationId:
+            application_id,
+
+          conversationId:
+            conversation_id,
+
+          question:
+            cleanQuestion,
+
+          reply,
+
+        }
+
+      );
+
+    } catch (error) {
+
+      console.error(
+        "SAVE REPLY ERROR:",
+        error
+      );
+
+    }
 
 
     return json({
-      success: true,
+
+      success:
+        true,
+
       reply,
+
+      model:
+        SARVAM_MODEL,
+
     });
+
   }
 
 
-  // ----------------------------------------
-  // Last 7 days
-  // ----------------------------------------
+  // ==========================================================
+  // STEP 3
+  // EXECUTE SARVAM DATA PLAN
+  // ==========================================================
 
-  const sevenDaysAgo =
-    getSevenDaysAgo();
+  let data;
 
+  try {
 
-  // ----------------------------------------
-  // Fetch data
-  // ----------------------------------------
+    data =
+      await executeDataPlan(
 
-  let activity = [];
-
-  let errors = [];
-
-
-  if (
-    intent === "activity" ||
-    intent === "combined"
-  ) {
-
-    activity =
-      await getActivity(
         env,
-        application.api_key,
-        sevenDaysAgo
+
+        plan,
+
+        application,
+
+        user_id,
+
+        application_id
+
       );
-  }
 
+  } catch (error) {
 
-  if (
-    intent === "errors" ||
-    intent === "combined"
-  ) {
-
-    errors =
-      await getErrors(
-        env,
-        application.api_key,
-        sevenDaysAgo
-      );
-  }
-
-
-  // ----------------------------------------
-  // Build AI context
-  // ----------------------------------------
-
-  const context =
-    buildContext(
-      activity,
-      errors
+    console.error(
+      "SUPABASE DATA ERROR:",
+      error
     );
 
 
-  // ----------------------------------------
-  // Ask Sarvam
-  // ----------------------------------------
+    return json(
+
+      {
+        error:
+          "Reportli could not retrieve the required data.",
+
+        details:
+          error?.message,
+
+      },
+
+      502
+
+    );
+
+  }
+
+
+  // ==========================================================
+  // STEP 4
+  // SARVAM ANALYZES REAL DATA
+  // ==========================================================
 
   let reply;
 
   try {
 
     reply =
-      await askSarvam(
+      await generateFinalAnswer(
+
         env,
-        question,
-        context
+
+        cleanQuestion,
+
+        data
+
       );
 
   } catch (error) {
 
     console.error(
-      "REPORTLI AI ERROR:",
+      "SARVAM ANALYSIS ERROR:",
       error
     );
 
 
     return json(
+
       {
         error:
-          "Reportli AI service failed.",
+          "Reportli AI failed to analyze the data.",
 
         details:
-          error?.message ||
-          "Unknown AI error.",
+          error?.message,
 
         model:
           SARVAM_MODEL,
+
       },
+
       502
+
     );
+
   }
 
 
-  // ----------------------------------------
-  // Save reply
-  // ----------------------------------------
+  // ==========================================================
+  // STEP 5
+  // SAVE ANSWER
+  // ==========================================================
 
-  let messageId = null;
+  let messageId =
+    null;
 
 
   try {
 
     messageId =
       await saveReply(
+
         env,
+
         {
-          userId: user_id,
-          applicationId: application_id,
-          conversationId: conversation_id,
-          question,
+          userId:
+            user_id,
+
+          applicationId:
+            application_id,
+
+          conversationId:
+            conversation_id,
+
+          question:
+            cleanQuestion,
+
           reply,
+
         }
+
       );
 
   } catch (error) {
 
     console.error(
-      "CHAT MESSAGE SAVE ERROR:",
+      "SAVE REPLY ERROR:",
       error
     );
 
-    // Don't fail the entire chat response
-    // just because saving the reply failed.
   }
 
 
-  // ----------------------------------------
-  // Return
-  // ----------------------------------------
+  // ==========================================================
+  // STEP 6
+  // RETURN ANSWER
+  // ==========================================================
 
   return json({
-    success: true,
+
+    success:
+      true,
 
     reply,
 
@@ -1226,14 +2047,34 @@ async function handleChat(
     model:
       SARVAM_MODEL,
 
-    period:
-      "last 7 days",
+    plan: {
+
+      type:
+        plan.type,
+
+      tables:
+        plan.tables.map(
+          item => ({
+            table:
+              item.table,
+
+            columns:
+              item.columns,
+          })
+        ),
+
+      time_range:
+        plan.time_range,
+
+    },
+
   });
+
 }
 
 
 // ============================================================
-// CLOUDFLARE WORKER ENTRY
+// CLOUDFLARE WORKER
 // ============================================================
 
 export default {
@@ -1243,34 +2084,51 @@ export default {
     env
   ) {
 
-    // ----------------------------------------
+    // --------------------------------------------------------
     // OPTIONS
-    // ----------------------------------------
+    // --------------------------------------------------------
 
     if (
-      request.method === "OPTIONS"
+      request.method ===
+      "OPTIONS"
     ) {
 
       return new Response(
+
         null,
+
         {
-          status: 204,
-          headers: corsHeaders(),
+          status:
+            204,
+
+          headers:
+            corsHeaders(),
+
         }
+
       );
+
     }
 
 
-    // ----------------------------------------
-    // GET /
-    // ----------------------------------------
+    const url =
+      new URL(
+        request.url
+      );
+
+
+    // --------------------------------------------------------
+    // HEALTH CHECK
+    // --------------------------------------------------------
 
     if (
-      request.method === "GET" &&
-      new URL(request.url).pathname === "/"
+      request.method ===
+        "GET" &&
+      url.pathname === "/"
     ) {
 
       return json({
+
         service:
           "Reportli AI Chat Worker",
 
@@ -1280,30 +2138,35 @@ export default {
         model:
           SARVAM_MODEL,
 
+        architecture:
+          "Sarvam Planner → Supabase → Sarvam Analyst",
+
         period:
           "last 7 days",
+
       });
+
     }
 
 
-    // ----------------------------------------
-    // POST /chat
-    // ----------------------------------------
-
-    const url =
-      new URL(request.url);
-
+    // --------------------------------------------------------
+    // CHAT
+    // --------------------------------------------------------
 
     if (
-      request.method === "POST" &&
+      request.method ===
+        "POST" &&
       url.pathname === "/chat"
     ) {
 
       try {
 
         return await handleChat(
+
           request,
+
           env
+
         );
 
       } catch (error) {
@@ -1315,6 +2178,7 @@ export default {
 
 
         return json(
+
           {
             error:
               "Reportli AI service failed.",
@@ -1322,23 +2186,33 @@ export default {
             details:
               error?.message ||
               "Unknown Worker error.",
+
           },
+
           500
+
         );
+
       }
+
     }
 
 
-    // ----------------------------------------
+    // --------------------------------------------------------
     // 404
-    // ----------------------------------------
+    // --------------------------------------------------------
 
     return json(
+
       {
         error:
           "Route not found.",
       },
+
       404
+
     );
+
   },
+
 };
