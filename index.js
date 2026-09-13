@@ -94,6 +94,13 @@ export default {
 
 
         // ====================================================
+        // CLEAN QUESTION
+        // ====================================================
+
+        const cleanQuestion = question.trim();
+
+
+        // ====================================================
         // GENERATE AI REPLY
         // ====================================================
 
@@ -105,23 +112,25 @@ export default {
         //
 
         const reply =
-          `I received your question: "${question.trim()}"`;
+          `I received your question: "${cleanQuestion}"`;
 
 
         // ====================================================
         // FIND EXISTING QUESTION ROW
         // ====================================================
 
-        // We look for the row that the FRONTEND already created.
+        // The FRONTEND already creates the question row.
         //
-        // It must match:
+        // This Worker does NOT create another row.
+        //
+        // We find the existing row using:
         //
         // user_id
         // application_id
         // conversation_id
         // question
         //
-        // And reply must still be NULL.
+        // And we only select rows where reply is NULL.
         //
 
         const params = new URLSearchParams();
@@ -143,7 +152,7 @@ export default {
 
         params.set(
           "question",
-          `eq.${question.trim()}`
+          `eq.${cleanQuestion}`
         );
 
         params.set(
@@ -166,6 +175,10 @@ export default {
           "1"
         );
 
+
+        // ====================================================
+        // FIND QUESTION IN SUPABASE
+        // ====================================================
 
         const findResponse = await fetch(
 
@@ -220,6 +233,10 @@ export default {
         }
 
 
+        // ====================================================
+        // PARSE QUESTION ROWS
+        // ====================================================
+
         let questionRows;
 
         try {
@@ -256,7 +273,7 @@ export default {
 
 
         // ====================================================
-        // GET EXISTING ROW ID
+        // GET EXISTING MESSAGE ID
         // ====================================================
 
         const existingMessage =
@@ -267,8 +284,35 @@ export default {
 
 
         // ====================================================
+        // VALIDATE MESSAGE ID
+        // ====================================================
+
+        if (!messageId) {
+
+          return json({
+
+            success: false,
+
+            error:
+              "Existing question row has no message ID"
+
+          }, 500);
+
+        }
+
+
+        // ====================================================
         // UPDATE EXISTING ROW
         // ====================================================
+
+        // IMPORTANT:
+        //
+        // We are PATCHING the existing row.
+        //
+        // We are NOT inserting a new row.
+        //
+        // Only the "reply" column is updated.
+        //
 
         const updateResponse = await fetch(
 
@@ -286,7 +330,7 @@ export default {
                 env.SUPABASE_SERVICE_ROLE_KEY,
 
               "Authorization":
-                `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY`,
+                `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
 
               "Prefer":
                 "return=representation"
@@ -294,11 +338,6 @@ export default {
             },
 
             body: JSON.stringify({
-
-              // ------------------------------------------------
-              // Keep the existing question.
-              // Only add the AI reply.
-              // ------------------------------------------------
 
               reply: reply
 
@@ -459,4 +498,4 @@ function json(data, status = 200) {
 
   );
 
-          }
+      }
