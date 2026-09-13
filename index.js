@@ -1,82 +1,15 @@
 // ============================================================
-// REPORTLI AI - INTELLIGENT CHAT WORKER
-// ============================================================
-//
-// FLOW:
-//
-// User question
-//      ↓
+// REPORTLI AI — CHAT WORKER
 // Cloudflare Worker
-//      ↓
-// SARVAM 105B - PLANNER
-//      ↓
-// Understand question
-//      ↓
-// Select required tables + columns
-//      ↓
-// Worker validates AI plan
-//      ↓
-// Supabase
-//      ↓
-// Relevant data
-//      ↓
-// SARVAM 105B - ANALYST
-//      ↓
-// Final answer
-//      ↓
-// Save answer to chat_messages
-//      ↓
-// Return answer
-//
-// ============================================================
-//
-// CURRENT DATA:
-//
-// chat_messages
-// user_activity
-// errors
-//
-// CURRENT ANALYTICS WINDOW:
-//
-// Last 7 days
-//
-// REQUIRED CLOUDFLARE SECRETS:
-//
-// SUPABASE_URL
-// SUPABASE_SERVICE_ROLE_KEY
-// SARVAM_API_KEY
-//
 // ============================================================
 
+const SARVAM_URL = "https://api.sarvam.ai/v1/chat/completions";
+const SARVAM_MODEL = "sarvam-105b";
 
-// ============================================================
-// CONFIGURATION
-// ============================================================
-
-const SARVAM_URL =
-  "https://api.sarvam.ai/v1/chat/completions";
-
-const SARVAM_MODEL =
-  "sarvam-105b";
-
-const MAX_ROWS_PER_TABLE =
-  5000;
-
-
-// ============================================================
-// ALLOWED DATABASE SCHEMA
-// ============================================================
-//
-// IMPORTANT:
-//
-// Sarvam can ONLY choose from these tables and columns.
-//
-// Never allow the AI to generate arbitrary SQL.
-//
-// ============================================================
-
-const DATABASE_SCHEMA = {
-
+// Only allow these tables and columns.
+// Sarvam can SELECT from this schema,
+// but it can NEVER generate SQL.
+const ALLOWED_SCHEMA = {
   chat_messages: [
     "id",
     "user_id",
@@ -105,8 +38,13 @@ const DATABASE_SCHEMA = {
     "ai_analysis",
     "user_id",
   ],
-
 };
+
+// Maximum rows we will fetch from one table.
+const MAX_ROWS_PER_TABLE = 5000;
+
+// Only analyze the last 7 days.
+const DAYS_TO_ANALYZE = 7;
 
 
 // ============================================================
@@ -114,22 +52,11 @@ const DATABASE_SCHEMA = {
 // ============================================================
 
 function corsHeaders() {
-
   return {
-
     "Access-Control-Allow-Origin": "*",
-
-    "Access-Control-Allow-Methods":
-      "GET, POST, OPTIONS",
-
-    "Access-Control-Allow-Headers":
-      "Content-Type, Authorization",
-
-    "Content-Type":
-      "application/json",
-
+    "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
   };
-
 }
 
 
@@ -137,39 +64,25 @@ function corsHeaders() {
 // JSON RESPONSE
 // ============================================================
 
-function json(data, status = 200) {
-
-  return new Response(
-
-    JSON.stringify(data),
-
-    {
-      status,
-
-      headers:
-        corsHeaders(),
-    }
-
-  );
-
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      ...corsHeaders(),
+      "Content-Type": "application/json",
+    },
+  });
 }
 
 
 // ============================================================
-// DATE
+// GET LAST 7 DAYS TIME RANGE
 // ============================================================
 
 function getSevenDaysAgo() {
-
-  const date =
-    new Date();
-
-  date.setUTCDate(
-    date.getUTCDate() - 7
-  );
-
-  return date.toISOString();
-
+  return new Date(
+    Date.now() - DAYS_TO_ANALYZE * 24 * 60 * 60 * 1000
+  ).toISOString();
 }
 
 
@@ -177,82 +90,43 @@ function getSevenDaysAgo() {
 // SUPABASE REQUEST
 // ============================================================
 
-async function supabaseRequest(
-  env,
-  path,
-  options = {}
-) {
+async function supabaseRequest(env, path, options = {}) {
+  const url = `${env.SUPABASE_URL}/rest/v1/${path}`;
 
-  const url =
-    `${env.SUPABASE_URL}${path}`;
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
+  });
 
-  const headers = {
-
-    "apikey":
-      env.SUPABASE_SERVICE_ROLE_KEY,
-
-    "Authorization":
-      `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-
-    "Content-Type":
-      "application/json",
-
-    ...(options.headers || {}),
-
-  };
-
-
-  const response =
-    await fetch(
-
-      url,
-
-      {
-        ...options,
-        headers,
-      }
-
-    );
-
-
-  const text =
-    await response.text();
-
+  const text = await response.text();
 
   let data;
 
   try {
-
-    data =
-      text
-        ? JSON.parse(text)
-        : null;
-
+    data = text ? JSON.parse(text) : null;
   } catch {
-
-    data =
-      text;
-
+    data = text;
   }
-
 
   if (!response.ok) {
+    console.error("SUPABASE ERROR", {
+      status: response.status,
+      statusText: response.statusText,
+      body: data,
+      path,
+    });
 
     throw new Error(
-
-      `Supabase HTTP ${response.status}: ${
-        typeof data === "string"
-          ? data
-          : JSON.stringify(data)
-      }`
-
+      `Supabase error ${response.status}: ${JSON.stringify(data)}`
     );
-
   }
 
-
   return data;
-
 }
 
 
@@ -260,852 +134,440 @@ async function supabaseRequest(
 // SARVAM REQUEST
 // ============================================================
 
-async function sarvamRequest(
-  env,
-  messages,
-  options = {}
-) {
+async function sarvamRequest(env, body, label = "SARVAM") {
+  const response = await fetch(SARVAM_URL, {
+    method: "POST",
 
-  if (!env.SARVAM_API_KEY) {
+    headers: {
+      "Content-Type": "application/json",
 
-    throw new Error(
-      "SARVAM_API_KEY is missing."
-    );
+      // Sarvam API authentication
+      "api-subscription-key": env.SARVAM_API_KEY,
 
-  }
+      // Bearer authentication is also supported
+      Authorization: `Bearer ${env.SARVAM_API_KEY}`,
+    },
 
+    body: JSON.stringify(body),
+  });
 
-  const body = {
-
-    model:
-      SARVAM_MODEL,
-
-    messages,
-
-    temperature:
-      options.temperature ?? 0.1,
-
-    max_tokens:
-      options.max_tokens ?? 3000,
-
-    reasoning_effort:
-      options.reasoning_effort ?? "medium",
-
-    stream:
-      false,
-
-  };
-
-
-  // ----------------------------------------------------------
-  // Structured output
-  // ----------------------------------------------------------
-
-  if (options.response_format) {
-
-    body.response_format =
-      options.response_format;
-
-  }
-
-
-  const response =
-    await fetch(
-
-      SARVAM_URL,
-
-      {
-
-        method:
-          "POST",
-
-        headers: {
-
-          "Content-Type":
-            "application/json",
-
-          "api-subscription-key":
-            env.SARVAM_API_KEY,
-
-          "Authorization":
-            `Bearer ${env.SARVAM_API_KEY}`,
-
-        },
-
-        body:
-          JSON.stringify(body),
-
-      }
-
-    );
-
-
-  const text =
-    await response.text();
-
+  const text = await response.text();
 
   let data;
 
   try {
-
-    data =
-      text
-        ? JSON.parse(text)
-        : null;
-
+    data = text ? JSON.parse(text) : null;
   } catch {
-
-    data =
-      text;
-
+    data = text;
   }
-
 
   if (!response.ok) {
-
-    console.error(
-      "SARVAM ERROR:",
-      JSON.stringify({
-        status:
-          response.status,
-
-        body:
-          data,
-      })
-    );
-
-
-    throw new Error(
-
-      `Sarvam API HTTP ${response.status}: ${
-        typeof data === "string"
-          ? data
-          : JSON.stringify(data)
-      }`
-
-    );
-
-  }
-
-
-  const content =
-    data?.choices?.[0]?.message?.content;
-
-
-  if (
-    typeof content !== "string" ||
-    !content.trim()
-  ) {
-
-    throw new Error(
-
-      `Sarvam returned no content: ${JSON.stringify(data)}`
-
-    );
-
-  }
-
-
-  return content.trim();
-
-}
-
-
-// ============================================================
-// EXTRACT JSON
-// ============================================================
-//
-// Safety fallback in case the model returns JSON wrapped
-// inside markdown despite response_format.
-//
-// ============================================================
-
-function extractJSON(text) {
-
-  if (
-    typeof text !== "string"
-  ) {
-
-    throw new Error(
-      "Expected JSON text from Sarvam."
-    );
-
-  }
-
-
-  // Direct JSON
-  try {
-
-    return JSON.parse(
-      text
-    );
-
-  } catch {}
-
-
-  // Remove markdown fences
-  const cleaned =
-    text
-      .replace(
-        /^```json\s*/i,
-        ""
-      )
-      .replace(
-        /^```\s*/i,
-        ""
-      )
-      .replace(
-        /\s*```$/i,
-        ""
-      )
-      .trim();
-
-
-  try {
-
-    return JSON.parse(
-      cleaned
-    );
-
-  } catch {}
-
-
-  throw new Error(
-    `Sarvam returned invalid JSON: ${text}`
-  );
-
-}
-
-
-// ============================================================
-// VALIDATE TABLE
-// ============================================================
-
-function isAllowedTable(
-  table
-) {
-
-  return Object.prototype
-    .hasOwnProperty.call(
-      DATABASE_SCHEMA,
-      table
-    );
-
-}
-
-
-// ============================================================
-// VALIDATE COLUMN
-// ============================================================
-
-function isAllowedColumn(
-  table,
-  column
-) {
-
-  if (
-    !isAllowedTable(table)
-  ) {
-
-    return false;
-
-  }
-
-
-  return DATABASE_SCHEMA[table]
-    .includes(column);
-
-}
-
-
-// ============================================================
-// VALIDATE SARVAM PLAN
-// ============================================================
-
-function validatePlan(
-  plan
-) {
-
-  if (
-    !plan ||
-    typeof plan !== "object"
-  ) {
-
-    throw new Error(
-      "Invalid Sarvam data plan."
-    );
-
-  }
-
-
-  if (
-    plan.type !== "data_query" &&
-    plan.type !== "conversation_query" &&
-    plan.type !== "general"
-  ) {
-
-    throw new Error(
-      "Sarvam returned an unsupported plan type."
-    );
-
-  }
-
-
-  // General question needs no database
-  if (
-    plan.type === "general"
-  ) {
-
-    return {
-      type:
-        "general",
-
-      tables: [],
-
-      time_range:
-        "last_7_days",
-    };
-
-  }
-
-
-  if (
-    !Array.isArray(plan.tables)
-  ) {
-
-    throw new Error(
-      "Sarvam plan does not contain tables."
-    );
-
-  }
-
-
-  const validatedTables = [];
-
-
-  for (
-    const tablePlan
-    of plan.tables
-  ) {
-
-    const table =
-      tablePlan?.table;
-
-
-    if (
-      !isAllowedTable(table)
-    ) {
-
-      throw new Error(
-        `Sarvam requested forbidden table: ${table}`
-      );
-
-    }
-
-
-    if (
-      !Array.isArray(
-        tablePlan.columns
-      )
-    ) {
-
-      throw new Error(
-        `No columns provided for ${table}.`
-      );
-
-    }
-
-
-    const columns = [];
-
-
-    for (
-      const column
-      of tablePlan.columns
-    ) {
-
-      if (
-        !isAllowedColumn(
-          table,
-          column
-        )
-      ) {
-
-        throw new Error(
-          `Sarvam requested forbidden column: ${table}.${column}`
-        );
-
-      }
-
-
-      if (
-        !columns.includes(column)
-      ) {
-
-        columns.push(column);
-
-      }
-
-    }
-
-
-    if (
-      columns.length === 0
-    ) {
-
-      throw new Error(
-        `No valid columns requested for ${table}.`
-      );
-
-    }
-
-
-    validatedTables.push({
-
-      table,
-
-      columns,
-
+    console.error(`${label} ERROR`, {
+      status: response.status,
+      statusText: response.statusText,
+      body: data,
     });
 
+    throw new Error(
+      `${label} failed (${response.status}): ${JSON.stringify(data)}`
+    );
   }
 
-
-  return {
-
-    type:
-      plan.type,
-
-    tables:
-      validatedTables,
-
-    time_range:
-      plan.time_range ===
-      "last_7_days"
-
-        ? "last_7_days"
-
-        : "last_7_days",
-
-  };
-
+  return data;
 }
 
 
 // ============================================================
-// SARVAM PLANNER
-// ============================================================
-//
-// This is the FIRST AI call.
-//
-// Sarvam understands the founder's question and decides
-// which data is necessary.
-//
+// EXTRACT SARVAM MESSAGE
 // ============================================================
 
-async function createDataPlan(
-  env,
-  question
-) {
+function extractSarvamContent(data) {
+  const content = data?.choices?.[0]?.message?.content;
 
-  const schemaText = `
+  if (typeof content !== "string" || !content.trim()) {
+    throw new Error(
+      `Sarvam returned no message content: ${JSON.stringify(data)}`
+    );
+  }
 
-TABLE: chat_messages
-
-COLUMNS:
-${DATABASE_SCHEMA.chat_messages.join(", ")}
-
-
-TABLE: user_activity
-
-COLUMNS:
-${DATABASE_SCHEMA.user_activity.join(", ")}
+  return content.trim();
+}
 
 
-TABLE: errors
+// ============================================================
+// PARSE JSON SAFELY
+// ============================================================
 
-COLUMNS:
-${DATABASE_SCHEMA.errors.join(", ")}
+function parseJsonFromSarvam(content) {
+  try {
+    return JSON.parse(content);
+  } catch {
+    // Sometimes models return JSON inside markdown fences.
+    const cleaned = content
+      .replace(/^```json\s*/i, "")
+      .replace(/^```\s*/i, "")
+      .replace(/\s*```$/i, "")
+      .trim();
 
-`;
+    try {
+      return JSON.parse(cleaned);
+    } catch {
+      throw new Error(
+        `Sarvam returned invalid JSON: ${content}`
+      );
+    }
+  }
+}
 
+
+// ============================================================
+// CREATE DATA PLAN
+//
+// Sarvam 105B #1
+//
+// Its job:
+// - Understand the question
+// - Decide which table(s) are needed
+// - Decide which columns are needed
+//
+// It does NOT generate SQL.
+// ============================================================
+
+async function createDataPlan(env, question) {
+  const schemaDescription = Object.entries(ALLOWED_SCHEMA)
+    .map(([table, columns]) => {
+      return `${table}: ${columns.join(", ")}`;
+    })
+    .join("\n");
 
   const systemPrompt = `
-
 You are the DATA PLANNER for Reportli AI.
 
-Reportli AI is an AI co-founder for SaaS founders.
+Your ONLY job is to understand the user's question and decide
+which Reportli database tables and columns are required to answer it.
 
-Your job is NOT to answer the founder's question.
+DATABASE SCHEMA:
 
-Your job is to understand the question and determine exactly which database tables and columns are required to answer it.
-
-AVAILABLE DATABASE SCHEMA:
-
-${schemaText}
+${schemaDescription}
 
 IMPORTANT RULES:
 
-1. You may ONLY choose tables listed in the schema.
+1. Only use tables and columns listed above.
+2. Never invent a table.
+3. Never invent a column.
+4. Never generate SQL.
+5. Never request customer information that does not exist.
+6. user_activity contains sessions and events, not customer profiles.
+7. errors contains error information.
+8. users is NOT available to this planner.
+9. applications is NOT available to this planner.
+10. Only data from the last 7 days is available for analytics.
+11. chat_messages should only be selected when the user is asking about
+    previous Reportli conversations/chat history.
+12. Select only the columns genuinely needed.
+13. If the question cannot be answered using this schema, return
+    can_answer=false.
+14. Keep the plan small and precise.
 
-2. You may ONLY choose columns listed for those tables.
+AVAILABLE DATA:
 
-3. NEVER invent a table.
+user_activity:
+- id
+- user_id
+- session_id
+- time
+- event
+- api_key
 
-4. NEVER invent a column.
+errors:
+- id
+- api_key
+- error_message
+- timestamp
+- ai_analysis
+- user_id
 
-5. NEVER generate SQL.
+chat_messages:
+- id
+- user_id
+- application_id
+- conversation_id
+- role
+- question
+- reply
+- created_at
 
-6. NEVER generate a Supabase URL.
+The application context is supplied separately by the Worker.
 
-7. NEVER request a secret, API key or password.
-
-8. Analytics data is limited to the LAST 7 DAYS.
-
-9. The user_activity table contains SaaS activity.
-
-10. user_activity.session_id represents a session.
-
-11. user_activity.event contains event information as JSONB.
-
-12. errors contains SaaS error information.
-
-13. chat_messages contains the founder's previous Reportli conversations.
-
-14. Do NOT use chat_messages for SaaS activity unless the founder specifically asks about previous Reportli conversations.
-
-15. Do NOT assume session_id equals a unique customer/user.
-
-16. Do NOT request user_activity.user_id to identify customers. It is not reliable customer identity for analytics.
-
-17. Request the minimum columns necessary.
-
-EXAMPLES:
-
-Question:
-"How many sessions did I have?"
-
-Plan:
-user_activity.session_id
-user_activity.time
-
-Question:
-"What events happened most frequently?"
-
-Plan:
-user_activity.event
-user_activity.time
-
-Question:
-"What is my most common error?"
-
-Plan:
-errors.error_message
-errors.timestamp
-
-Question:
-"When did errors increase?"
-
-Plan:
-errors.error_message
-errors.timestamp
-
-Question:
-"Give me a summary of what happened in my SaaS."
-
-Plan:
-user_activity.session_id
-user_activity.time
-user_activity.event
-
-AND
-
-errors.error_message
-errors.timestamp
-errors.ai_analysis
-
-Question:
-"What did I ask Reportli yesterday?"
-
-Plan:
-chat_messages.question
-chat_messages.reply
-chat_messages.created_at
-chat_messages.role
-
-If no database data is required, return type "general".
-
-Always return ONLY the requested JSON structure.
-
+Return ONLY the requested JSON structure.
 `;
-
 
   const userPrompt = `
-
-Founder question:
+USER QUESTION:
 
 ${question}
-
-Determine the minimum database data required to answer this question.
-
-Return only a data plan.
-
 `;
 
+  const body = {
+    model: SARVAM_MODEL,
 
-  const response =
-    await sarvamRequest(
-
-      env,
-
-      [
-
-        {
-          role:
-            "system",
-
-          content:
-            systemPrompt,
-
-        },
-
-        {
-          role:
-            "user",
-
-          content:
-            userPrompt,
-
-        },
-
-      ],
-
+    messages: [
       {
+        role: "system",
+        content: systemPrompt,
+      },
+      {
+        role: "user",
+        content: userPrompt,
+      },
+    ],
 
-        temperature:
-          0,
+    // IMPORTANT:
+    // Planner does not need reasoning.
+    // This prevents reasoning tokens from consuming
+    // the small planner output budget.
+    reasoning_effort: null,
 
-        max_tokens:
-          1000,
+    temperature: 0,
 
-        reasoning_effort:
-          "medium",
+    max_tokens: 1000,
 
-        response_format: {
+    response_format: {
+      type: "json_schema",
 
-          type:
-            "json_schema",
+      json_schema: {
+        name: "reportli_data_plan",
 
-          json_schema: {
+        strict: true,
 
-            name:
-              "reportli_data_plan",
+        schema: {
+          type: "object",
 
-            strict:
-              true,
+          additionalProperties: false,
 
-            schema: {
-
-              type:
-                "object",
-
-              properties: {
-
-                type: {
-
-                  type:
-                    "string",
-
-                  enum: [
-                    "data_query",
-                    "conversation_query",
-                    "general",
-                  ],
-
-                },
-
-                tables: {
-
-                  type:
-                    "array",
-
-                  items: {
-
-                    type:
-                      "object",
-
-                    properties: {
-
-                      table: {
-                        type:
-                          "string",
-                      },
-
-                      columns: {
-
-                        type:
-                          "array",
-
-                        items: {
-                          type:
-                            "string",
-                        },
-
-                      },
-
-                    },
-
-                    required: [
-                      "table",
-                      "columns",
-                    ],
-
-                    additionalProperties:
-                      false,
-
-                  },
-
-                },
-
-                time_range: {
-
-                  type:
-                    "string",
-
-                  enum: [
-                    "last_7_days",
-                  ],
-
-                },
-
-                reason: {
-
-                  type:
-                    "string",
-
-                },
-
-              },
-
-              required: [
-                "type",
-                "tables",
-                "time_range",
-                "reason",
-              ],
-
-              additionalProperties:
-                false,
-
+          properties: {
+            can_answer: {
+              type: "boolean",
             },
 
+            reason: {
+              type: "string",
+            },
+
+            tables: {
+              type: "array",
+
+              items: {
+                type: "object",
+
+                additionalProperties: false,
+
+                properties: {
+                  table: {
+                    type: "string",
+
+                    enum: [
+                      "user_activity",
+                      "errors",
+                      "chat_messages",
+                    ],
+                  },
+
+                  columns: {
+                    type: "array",
+
+                    items: {
+                      type: "string",
+                    },
+                  },
+                },
+
+                required: [
+                  "table",
+                  "columns",
+                ],
+              },
+            },
           },
 
+          required: [
+            "can_answer",
+            "reason",
+            "tables",
+          ],
         },
+      },
+    },
+  };
 
-      }
-
-    );
-
-
-  const plan =
-    extractJSON(
-      response
-    );
-
-
-  return validatePlan(
-    plan
+  const data = await sarvamRequest(
+    env,
+    body,
+    "SARVAM PLANNER"
   );
 
+  const content = extractSarvamContent(data);
+
+  const plan = parseJsonFromSarvam(content);
+
+  return plan;
 }
 
 
 // ============================================================
-// SAFE COLUMN SELECT
+// VALIDATE DATA PLAN
+//
+// NEVER trust Sarvam blindly.
+//
+// Worker checks every table and every column.
 // ============================================================
 
-function buildSelect(
-  columns
-) {
+function validatePlan(plan) {
+  if (!plan || typeof plan !== "object") {
+    throw new Error("Invalid planner response");
+  }
 
-  return columns
-    .join(",");
+  if (typeof plan.can_answer !== "boolean") {
+    throw new Error("Planner missing can_answer");
+  }
 
+  if (typeof plan.reason !== "string") {
+    throw new Error("Planner missing reason");
+  }
+
+  if (!Array.isArray(plan.tables)) {
+    throw new Error("Planner missing tables");
+  }
+
+  // If Sarvam says it cannot answer,
+  // there is no database query.
+  if (!plan.can_answer) {
+    return {
+      can_answer: false,
+      reason: plan.reason,
+      tables: [],
+    };
+  }
+
+  const validatedTables = [];
+
+  for (const requestedTable of plan.tables) {
+    if (!requestedTable || typeof requestedTable !== "object") {
+      throw new Error("Invalid table plan");
+    }
+
+    const table = requestedTable.table;
+
+    if (!Object.prototype.hasOwnProperty.call(
+      ALLOWED_SCHEMA,
+      table
+    )) {
+      throw new Error(
+        `Planner requested forbidden table: ${table}`
+      );
+    }
+
+    if (!Array.isArray(requestedTable.columns)) {
+      throw new Error(
+        `Planner columns missing for table: ${table}`
+      );
+    }
+
+    const allowedColumns = ALLOWED_SCHEMA[table];
+
+    const columns = [];
+
+    for (const column of requestedTable.columns) {
+      if (
+        typeof column !== "string" ||
+        !allowedColumns.includes(column)
+      ) {
+        throw new Error(
+          `Planner requested forbidden column: ${table}.${column}`
+        );
+      }
+
+      if (!columns.includes(column)) {
+        columns.push(column);
+      }
+    }
+
+    if (columns.length === 0) {
+      throw new Error(
+        `Planner requested no columns for table: ${table}`
+      );
+    }
+
+    validatedTables.push({
+      table,
+      columns,
+    });
+  }
+
+  return {
+    can_answer: true,
+    reason: plan.reason,
+    tables: validatedTables,
+  };
 }
 
 
 // ============================================================
-// FETCH USER ACTIVITY
+// SUPABASE QUERY HELPERS
 // ============================================================
+
+
+// ------------------------------------------------------------
+// USER ACTIVITY
+// ------------------------------------------------------------
 
 async function fetchUserActivity(
   env,
   apiKey,
-  columns,
-  sevenDaysAgo
+  columns
 ) {
+  const select = columns.join(",");
 
-  const select =
-    buildSelect(
-      columns
-    );
-
+  const sevenDaysAgo = getSevenDaysAgo();
 
   const path =
-    `/rest/v1/user_activity` +
-    `?api_key=eq.${encodeURIComponent(apiKey)}` +
+    `user_activity?select=${encodeURIComponent(select)}` +
+    `&api_key=eq.${encodeURIComponent(apiKey)}` +
     `&time=gte.${encodeURIComponent(sevenDaysAgo)}` +
-    `&select=${encodeURIComponent(select)}` +
     `&order=time.desc` +
     `&limit=${MAX_ROWS_PER_TABLE}`;
 
-
-  return await supabaseRequest(
-    env,
-    path
-  );
-
+  return await supabaseRequest(env, path);
 }
 
 
-// ============================================================
-// FETCH ERRORS
-// ============================================================
+// ------------------------------------------------------------
+// ERRORS
+// ------------------------------------------------------------
 
 async function fetchErrors(
   env,
   apiKey,
-  columns,
-  sevenDaysAgo
+  columns
 ) {
+  const select = columns.join(",");
 
-  const select =
-    buildSelect(
-      columns
-    );
-
+  const sevenDaysAgo = getSevenDaysAgo();
 
   const path =
-    `/rest/v1/errors` +
-    `?api_key=eq.${encodeURIComponent(apiKey)}` +
+    `errors?select=${encodeURIComponent(select)}` +
+    `&api_key=eq.${encodeURIComponent(apiKey)}` +
     `&timestamp=gte.${encodeURIComponent(sevenDaysAgo)}` +
-    `&select=${encodeURIComponent(select)}` +
     `&order=timestamp.desc` +
     `&limit=${MAX_ROWS_PER_TABLE}`;
 
-
-  return await supabaseRequest(
-    env,
-    path
-  );
-
+  return await supabaseRequest(env, path);
 }
 
 
-// ============================================================
-// FETCH CHAT MESSAGES
-// ============================================================
+// ------------------------------------------------------------
+// CHAT MESSAGES
+// ------------------------------------------------------------
 
 async function fetchChatMessages(
   env,
@@ -1113,475 +575,244 @@ async function fetchChatMessages(
   applicationId,
   columns
 ) {
+  const select = columns.join(",");
 
-  const select =
-    buildSelect(
-      columns
-    );
-
+  const sevenDaysAgo = getSevenDaysAgo();
 
   const path =
-    `/rest/v1/chat_messages` +
-    `?user_id=eq.${encodeURIComponent(userId)}` +
+    `chat_messages?select=${encodeURIComponent(select)}` +
+    `&user_id=eq.${encodeURIComponent(userId)}` +
     `&application_id=eq.${encodeURIComponent(applicationId)}` +
-    `&created_at=gte.${encodeURIComponent(getSevenDaysAgo())}` +
-    `&select=${encodeURIComponent(select)}` +
+    `&created_at=gte.${encodeURIComponent(sevenDaysAgo)}` +
     `&order=created_at.desc` +
     `&limit=${MAX_ROWS_PER_TABLE}`;
 
-
-  return await supabaseRequest(
-    env,
-    path
-  );
-
+  return await supabaseRequest(env, path);
 }
 
 
 // ============================================================
 // EXECUTE DATA PLAN
 // ============================================================
-//
-// Sarvam chooses what it needs.
-// Worker decides HOW to query it.
-//
-// ============================================================
 
 async function executeDataPlan(
   env,
   plan,
-  application,
-  userId,
-  applicationId
+  context
 ) {
+  const results = {};
 
-  const sevenDaysAgo =
-    getSevenDaysAgo();
-
-
-  const result = {
-
-    period:
-      "last 7 days",
-
-    tables: {},
-
-  };
-
-
-  for (
-    const tablePlan
-    of plan.tables
-  ) {
-
+  for (const tablePlan of plan.tables) {
     const {
       table,
       columns,
-    } =
-      tablePlan;
+    } = tablePlan;
 
-
-    // --------------------------------------------------------
-    // USER ACTIVITY
-    // --------------------------------------------------------
-
-    if (
-      table ===
-      "user_activity"
-    ) {
-
-      const rows =
+    if (table === "user_activity") {
+      results.user_activity =
         await fetchUserActivity(
-
           env,
-
-          application.api_key,
-
-          columns,
-
-          sevenDaysAgo
-
-        );
-
-
-      result.tables.user_activity = {
-
-        columns,
-
-        row_count:
-          rows.length,
-
-        rows,
-
-      };
-
-      continue;
-
-    }
-
-
-    // --------------------------------------------------------
-    // ERRORS
-    // --------------------------------------------------------
-
-    if (
-      table ===
-      "errors"
-    ) {
-
-      const rows =
-        await fetchErrors(
-
-          env,
-
-          application.api_key,
-
-          columns,
-
-          sevenDaysAgo
-
-        );
-
-
-      result.tables.errors = {
-
-        columns,
-
-        row_count:
-          rows.length,
-
-        rows,
-
-      };
-
-      continue;
-
-    }
-
-
-    // --------------------------------------------------------
-    // CHAT MESSAGES
-    // --------------------------------------------------------
-
-    if (
-      table ===
-      "chat_messages"
-    ) {
-
-      const rows =
-        await fetchChatMessages(
-
-          env,
-
-          userId,
-
-          applicationId,
-
+          context.apiKey,
           columns
-
         );
-
-
-      result.tables.chat_messages = {
-
-        columns,
-
-        row_count:
-          rows.length,
-
-        rows,
-
-      };
-
-      continue;
-
     }
 
+    else if (table === "errors") {
+      results.errors =
+        await fetchErrors(
+          env,
+          context.apiKey,
+          columns
+        );
+    }
+
+    else if (table === "chat_messages") {
+      results.chat_messages =
+        await fetchChatMessages(
+          env,
+          context.userId,
+          context.applicationId,
+          columns
+        );
+    }
   }
 
-
-  return result;
-
+  return results;
 }
 
 
 // ============================================================
 // FINAL SARVAM ANALYSIS
-// ============================================================
 //
-// This is the SECOND AI call.
+// Sarvam 105B #2
 //
-// Now Sarvam has the actual database data.
+// This call receives:
+// - Original question
+// - Database data
+// - Context
 //
+// It analyzes the data and writes the final answer.
 // ============================================================
 
 async function generateFinalAnswer(
   env,
   question,
-  data
+  data,
+  context
 ) {
-
   const systemPrompt = `
-
 You are Reportli AI.
 
 You are an AI co-founder for a SaaS founder.
 
-The founder asked a question about their SaaS.
+Your job is to analyze the supplied SaaS data and answer
+the founder's question clearly and honestly.
 
-You have been given real data from the Reportli database.
+IMPORTANT DATA LIMITS:
 
-Answer the founder using ONLY the provided data.
-
-IMPORTANT:
-
-- Do not invent data.
-- Do not invent customers.
-- Do not invent revenue.
-- Do not invent conversions.
-- Do not invent retention.
-- Do not invent churn.
-- Do not claim session count equals user count.
-- A session is NOT necessarily a unique user.
-- If the available data cannot answer the question, say so.
-- Be direct and useful.
-- Prioritize important insights.
-- Mention numbers when available.
-- If you see a meaningful pattern, explain it.
-- If there is a technical problem, explain why it may matter.
-- Do not expose database implementation details.
-- Do not mention API keys.
-- Do not mention internal prompts.
-- Do not mention that you are an AI data planner.
-
-The data covers the last 7 days unless the data itself indicates otherwise.
-
+1. You only have data supplied in this request.
+2. The analytics data covers only the last 7 days.
+3. user_activity represents sessions and events.
+4. It does NOT represent a complete customer database.
+5. Do not claim to know a customer's identity unless the data
+   explicitly contains enough information.
+6. Do not invent missing data.
+7. Do not invent revenue, conversion, churn, retention,
+   customer names, or customer profiles.
+8. If something cannot be determined, say so.
+9. Use exact numbers from the supplied data.
+10. Do not mention internal database implementation unless useful.
+11. Give practical founder-focused conclusions.
+12. If there is a problem, explain:
+    - what happened
+    - how often it happened
+    - why it matters
+    - what the founder should investigate or do next
+13. Do not pretend that sessions are unique users.
+14. If the question asks for "users" but the data only contains
+    sessions, clearly explain the limitation.
+15. Keep the response concise but useful.
 `;
 
-
   const userPrompt = `
+APPLICATION CONTEXT:
 
-FOUNDER QUESTION:
+Application ID:
+${context.applicationId}
+
+API key:
+${context.apiKey}
+
+USER QUESTION:
 
 ${question}
 
+DATABASE DATA:
 
-REPORTLI DATA:
-
-${JSON.stringify(
-  data,
-  null,
-  2
-)}
-
-
-Now answer the founder's question.
-
-Give a concise but useful answer.
-
+${JSON.stringify(data)}
 `;
 
+  const body = {
+    model: SARVAM_MODEL,
 
-  return await sarvamRequest(
-
-    env,
-
-    [
-
+    messages: [
       {
-        role:
-          "system",
-
-        content:
-          systemPrompt,
-
+        role: "system",
+        content: systemPrompt,
       },
-
       {
-        role:
-          "user",
-
-        content:
-          userPrompt,
-
+        role: "user",
+        content: userPrompt,
       },
-
     ],
 
-    {
+    // Final answer can use reasoning.
+    reasoning_effort: "medium",
 
-      temperature:
-        0.2,
+    temperature: 0.2,
 
-      max_tokens:
-        2500,
+    max_tokens: 2500,
+  };
 
-      reasoning_effort:
-        "medium",
-
-    }
-
+  const response = await sarvamRequest(
+    env,
+    body,
+    "SARVAM ANALYST"
   );
 
+  return extractSarvamContent(response);
 }
 
 
 // ============================================================
-// FIND APPLICATION
+// FIND EXISTING CHAT MESSAGE
+//
+// Current frontend architecture creates the question row first.
+// Worker finds that row and adds the reply.
+//
+// NOTE:
+// A future improvement is sending message_id directly.
 // ============================================================
 
-async function getApplication(
+async function findPendingChatMessage(
   env,
-  userId,
-  applicationId
+  context,
+  question
 ) {
-
   const path =
-    `/rest/v1/applications` +
-
-    `?id=eq.${encodeURIComponent(
-      applicationId
-    )}` +
-
-    `&user_id=eq.${encodeURIComponent(
-      userId
-    )}` +
-
-    `&select=id,name,api_key,user_id,status,domain` +
-
+    `chat_messages?select=id` +
+    `&user_id=eq.${encodeURIComponent(context.userId)}` +
+    `&application_id=eq.${encodeURIComponent(context.applicationId)}` +
+    `&conversation_id=eq.${encodeURIComponent(context.conversationId)}` +
+    `&question=eq.${encodeURIComponent(question)}` +
+    `&reply=is.null` +
+    `&order=created_at.desc` +
     `&limit=1`;
 
+  const rows = await supabaseRequest(
+    env,
+    path
+  );
 
-  const applications =
-    await supabaseRequest(
-      env,
-      path
-    );
-
-
-  if (
-    !applications ||
-    applications.length === 0
-  ) {
-
-    return null;
-
-  }
-
-
-  return applications[0];
-
+  return rows?.[0]?.id || null;
 }
 
 
 // ============================================================
-// SAVE CHAT REPLY
+// SAVE REPLY
 // ============================================================
 
 async function saveReply(
   env,
-  {
-    userId,
-    applicationId,
-    conversationId,
-    question,
-    reply,
-  }
+  messageId,
+  reply
 ) {
-
-  const searchPath =
-
-    `/rest/v1/chat_messages` +
-
-    `?user_id=eq.${encodeURIComponent(
-      userId
-    )}` +
-
-    `&application_id=eq.${encodeURIComponent(
-      applicationId
-    )}` +
-
-    `&conversation_id=eq.${encodeURIComponent(
-      conversationId
-    )}` +
-
-    `&question=eq.${encodeURIComponent(
-      question
-    )}` +
-
-    `&reply=is.null` +
-
-    `&select=id` +
-
-    `&order=created_at.desc` +
-
-    `&limit=1`;
-
-
-  const rows =
-    await supabaseRequest(
-      env,
-      searchPath
-    );
-
-
-  if (
-    !rows ||
-    rows.length === 0
-  ) {
-
+  if (!messageId) {
     console.warn(
-      "No matching chat_messages row found."
+      "No pending chat message found. Reply will not be saved."
     );
 
-    return null;
-
+    return;
   }
 
-
-  const messageId =
-    rows[0].id;
-
-
-  const updatePath =
-
-    `/rest/v1/chat_messages` +
-
-    `?id=eq.${encodeURIComponent(
-      messageId
-    )}`;
-
+  const path =
+    `chat_messages?id=eq.${encodeURIComponent(messageId)}`;
 
   await supabaseRequest(
-
     env,
-
-    updatePath,
-
+    path,
     {
-
-      method:
-        "PATCH",
+      method: "PATCH",
 
       headers: {
-
-        "Prefer":
-          "return=minimal",
-
+        Prefer: "return=minimal",
       },
 
-      body:
-        JSON.stringify({
-          reply,
-        }),
-
+      body: JSON.stringify({
+        reply,
+      }),
     }
-
   );
-
-
-  return messageId;
-
 }
 
 
@@ -1589,48 +820,30 @@ async function saveReply(
 // MAIN CHAT HANDLER
 // ============================================================
 
-async function handleChat(
-  request,
-  env
-) {
-
-  // ----------------------------------------------------------
-  // Parse body
-  // ----------------------------------------------------------
-
+async function handleChat(request, env) {
   let body;
 
   try {
-
-    body =
-      await request.json();
-
+    body = await request.json();
   } catch {
-
-    return json(
-
+    return jsonResponse(
       {
-        error:
-          "Invalid JSON request body.",
+        error: "Invalid JSON body",
       },
-
       400
-
     );
-
   }
-
 
   const {
     user_id,
     application_id,
     conversation_id,
     question,
+    api_key,
   } = body;
 
-
   // ----------------------------------------------------------
-  // Validate input
+  // VALIDATE REQUEST
   // ----------------------------------------------------------
 
   if (
@@ -1639,513 +852,316 @@ async function handleChat(
     !conversation_id ||
     !question
   ) {
-
-    return json(
-
+    return jsonResponse(
       {
         error:
-          "Missing user_id, application_id, conversation_id or question.",
+          "user_id, application_id, conversation_id and question are required",
       },
-
       400
-
     );
-
   }
 
+  // ----------------------------------------------------------
+  // API KEY
+  //
+  // The frontend should ideally provide the application's API key.
+  // ----------------------------------------------------------
 
-  if (
-    typeof question !== "string" ||
-    !question.trim()
-  ) {
-
-    return json(
-
+  if (!api_key) {
+    return jsonResponse(
       {
-        error:
-          "Question must be a non-empty string.",
+        error: "api_key is required",
       },
-
       400
-
     );
-
   }
-
 
   const cleanQuestion =
-    question.trim();
+    String(question).trim();
 
-
-  // ----------------------------------------------------------
-  // Validate application
-  // ----------------------------------------------------------
-
-  const application =
-    await getApplication(
-
-      env,
-
-      user_id,
-
-      application_id
-
-    );
-
-
-  if (!application) {
-
-    return json(
-
+  if (!cleanQuestion) {
+    return jsonResponse(
       {
-        error:
-          "Application not found or does not belong to this user.",
+        error: "Question cannot be empty",
       },
-
-      404
-
+      400
     );
-
   }
 
+  // ----------------------------------------------------------
+  // CONTEXT
+  // ----------------------------------------------------------
 
-  if (
-    !application.api_key
-  ) {
+  const context = {
+    userId: String(user_id),
+    applicationId: String(application_id),
+    conversationId: String(conversation_id),
+    apiKey: String(api_key),
+  };
 
-    return json(
+  console.log(
+    "CHAT REQUEST",
+    {
+      applicationId: context.applicationId,
+      conversationId: context.conversationId,
+      question: cleanQuestion,
+    }
+  );
 
-      {
-        error:
-          "Application does not have an API key.",
-      },
 
-      400
+  // ==========================================================
+  // STEP 1 — SARVAM 105B PLANNER
+  // ==========================================================
 
+  let rawPlan;
+
+  try {
+    rawPlan = await createDataPlan(
+      env,
+      cleanQuestion
+    );
+  } catch (error) {
+    console.error(
+      "SARVAM PLANNER ERROR:",
+      error?.message || String(error)
     );
 
+    return jsonResponse(
+      {
+        error:
+          "I couldn't understand the data needed for this question.",
+        details:
+          error?.message || String(error),
+      },
+      502
+    );
   }
 
 
   // ==========================================================
-  // STEP 1
-  // SARVAM UNDERSTANDS THE QUESTION
+  // STEP 2 — VALIDATE SARVAM PLAN
   // ==========================================================
 
   let plan;
 
   try {
-
-    plan =
-      await createDataPlan(
-
-        env,
-
-        cleanQuestion
-
-      );
-
+    plan = validatePlan(rawPlan);
   } catch (error) {
-
     console.error(
-      "SARVAM PLANNER ERROR:",
-      error
+      "DATA PLAN VALIDATION ERROR:",
+      error?.message || String(error),
+      rawPlan
     );
 
-
-    return json(
-
+    return jsonResponse(
       {
         error:
-          "Reportli could not understand the question.",
-
-        details:
-          error?.message ||
-          "Unknown planner error.",
-
-        model:
-          SARVAM_MODEL,
-
+          "The AI generated an invalid data request.",
       },
-
-      502
-
+      500
     );
-
   }
 
 
+  console.log(
+    "DATA PLAN",
+    JSON.stringify(plan)
+  );
+
+
   // ==========================================================
-  // STEP 2
-  // GENERAL QUESTION
+  // STEP 3 — QUESTION CANNOT BE ANSWERED
   // ==========================================================
 
-  if (
-    plan.type ===
-    "general"
-  ) {
-
-    let reply;
+  if (!plan.can_answer) {
+    const reply =
+      "I can't answer that with the data Reportli currently has. " +
+      plan.reason;
 
     try {
-
-      reply =
-        await generateFinalAnswer(
-
+      const messageId =
+        await findPendingChatMessage(
           env,
-
-          cleanQuestion,
-
-          {
-            period:
-              "last 7 days",
-
-            tables: {},
-
-          }
-
+          context,
+          cleanQuestion
         );
 
-    } catch (error) {
-
-      console.error(
-        "SARVAM FINAL ERROR:",
-        error
-      );
-
-
-      return json(
-
-        {
-          error:
-            "Reportli AI failed to generate an answer.",
-
-          details:
-            error?.message,
-
-          model:
-            SARVAM_MODEL,
-
-        },
-
-        502
-
-      );
-
-    }
-
-
-    try {
-
       await saveReply(
-
         env,
-
-        {
-          userId:
-            user_id,
-
-          applicationId:
-            application_id,
-
-          conversationId:
-            conversation_id,
-
-          question:
-            cleanQuestion,
-
-          reply,
-
-        }
-
+        messageId,
+        reply
       );
-
     } catch (error) {
-
       console.error(
-        "SAVE REPLY ERROR:",
-        error
+        "SAVE UNSUPPORTED REPLY ERROR:",
+        error?.message || String(error)
       );
-
     }
 
-
-    return json({
-
-      success:
-        true,
-
+    return jsonResponse({
+      success: true,
       reply,
-
-      model:
-        SARVAM_MODEL,
-
+      plan,
     });
-
   }
 
 
   // ==========================================================
-  // STEP 3
-  // EXECUTE SARVAM DATA PLAN
+  // STEP 4 — FETCH RELEVANT SUPABASE DATA
   // ==========================================================
 
   let data;
 
   try {
-
-    data =
-      await executeDataPlan(
-
-        env,
-
-        plan,
-
-        application,
-
-        user_id,
-
-        application_id
-
-      );
-
+    data = await executeDataPlan(
+      env,
+      plan,
+      context
+    );
   } catch (error) {
-
     console.error(
       "SUPABASE DATA ERROR:",
-      error
+      error?.message || String(error)
     );
 
-
-    return json(
-
+    return jsonResponse(
       {
         error:
-          "Reportli could not retrieve the required data.",
-
+          "I couldn't retrieve the SaaS data needed to answer that.",
         details:
-          error?.message,
-
+          error?.message || String(error),
       },
-
       502
-
     );
-
   }
 
 
   // ==========================================================
-  // STEP 4
-  // SARVAM ANALYZES REAL DATA
+  // STEP 5 — SARVAM 105B ANALYST
   // ==========================================================
 
   let reply;
 
   try {
-
-    reply =
-      await generateFinalAnswer(
-
-        env,
-
-        cleanQuestion,
-
-        data
-
-      );
-
+    reply = await generateFinalAnswer(
+      env,
+      cleanQuestion,
+      data,
+      context
+    );
   } catch (error) {
-
     console.error(
-      "SARVAM ANALYSIS ERROR:",
-      error
+      "SARVAM ANALYST ERROR:",
+      error?.message || String(error)
     );
 
-
-    return json(
-
+    return jsonResponse(
       {
         error:
-          "Reportli AI failed to analyze the data.",
-
+          "I retrieved the data, but I couldn't analyze it right now.",
         details:
-          error?.message,
-
-        model:
-          SARVAM_MODEL,
-
+          error?.message || String(error),
       },
-
       502
-
     );
-
   }
 
 
   // ==========================================================
-  // STEP 5
-  // SAVE ANSWER
+  // STEP 6 — SAVE REPLY TO chat_messages
   // ==========================================================
-
-  let messageId =
-    null;
-
 
   try {
-
-    messageId =
-      await saveReply(
-
+    const messageId =
+      await findPendingChatMessage(
         env,
-
-        {
-          userId:
-            user_id,
-
-          applicationId:
-            application_id,
-
-          conversationId:
-            conversation_id,
-
-          question:
-            cleanQuestion,
-
-          reply,
-
-        }
-
+        context,
+        cleanQuestion
       );
 
+    await saveReply(
+      env,
+      messageId,
+      reply
+    );
   } catch (error) {
-
     console.error(
       "SAVE REPLY ERROR:",
-      error
+      error?.message || String(error)
     );
 
+    // We still return the answer to the frontend.
+    // Saving failure should not destroy a successful AI response.
   }
 
 
   // ==========================================================
-  // STEP 6
-  // RETURN ANSWER
+  // STEP 7 — RETURN TO FRONTEND
   // ==========================================================
 
-  return json({
-
-    success:
-      true,
-
+  return jsonResponse({
+    success: true,
     reply,
-
-    message_id:
-      messageId,
-
-    model:
-      SARVAM_MODEL,
-
-    plan: {
-
-      type:
-        plan.type,
-
-      tables:
-        plan.tables.map(
-          item => ({
-            table:
-              item.table,
-
-            columns:
-              item.columns,
-          })
-        ),
-
-      time_range:
-        plan.time_range,
-
-    },
-
   });
-
 }
 
 
 // ============================================================
-// CLOUDFLARE WORKER
+// HEALTH CHECK
+// ============================================================
+
+async function handleHealth() {
+  return jsonResponse({
+    ok: true,
+    service: "reportli-ai-chat",
+    model: SARVAM_MODEL,
+    timestamp: new Date().toISOString(),
+  });
+}
+
+
+// ============================================================
+// CLOUDFLARE WORKER ENTRY POINT
 // ============================================================
 
 export default {
-
-  async fetch(
-    request,
-    env
-  ) {
-
+  async fetch(request, env) {
     // --------------------------------------------------------
-    // OPTIONS
+    // CORS PREFLIGHT
     // --------------------------------------------------------
 
-    if (
-      request.method ===
-      "OPTIONS"
-    ) {
-
-      return new Response(
-
-        null,
-
-        {
-          status:
-            204,
-
-          headers:
-            corsHeaders(),
-
-        }
-
-      );
-
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders(),
+      });
     }
 
 
-    const url =
-      new URL(
-        request.url
-      );
+    // --------------------------------------------------------
+    // URL
+    // --------------------------------------------------------
+
+    const url = new URL(request.url);
 
 
     // --------------------------------------------------------
-    // HEALTH CHECK
+    // HEALTH
     // --------------------------------------------------------
 
     if (
-      request.method ===
-        "GET" &&
+      request.method === "GET" &&
       url.pathname === "/"
     ) {
+      return handleHealth();
+    }
 
-      return json({
 
-        service:
-          "Reportli AI Chat Worker",
-
-        status:
-          "online",
-
-        model:
-          SARVAM_MODEL,
-
-        architecture:
-          "Sarvam Planner → Supabase → Sarvam Analyst",
-
-        period:
-          "last 7 days",
-
-      });
-
+    if (
+      request.method === "GET" &&
+      url.pathname === "/health"
+    ) {
+      return handleHealth();
     }
 
 
@@ -2154,47 +1170,29 @@ export default {
     // --------------------------------------------------------
 
     if (
-      request.method ===
-        "POST" &&
+      request.method === "POST" &&
       url.pathname === "/chat"
     ) {
-
       try {
-
         return await handleChat(
-
           request,
-
           env
-
         );
-
       } catch (error) {
-
         console.error(
-          "UNHANDLED WORKER ERROR:",
-          error
+          "UNHANDLED CHAT ERROR:",
+          error?.message || String(error),
+          error?.stack
         );
 
-
-        return json(
-
+        return jsonResponse(
           {
             error:
-              "Reportli AI service failed.",
-
-            details:
-              error?.message ||
-              "Unknown Worker error.",
-
+              "Something went wrong while processing the chat request.",
           },
-
           500
-
         );
-
       }
-
     }
 
 
@@ -2202,17 +1200,11 @@ export default {
     // 404
     // --------------------------------------------------------
 
-    return json(
-
+    return jsonResponse(
       {
-        error:
-          "Route not found.",
+        error: "Not found",
       },
-
       404
-
     );
-
   },
-
 };
