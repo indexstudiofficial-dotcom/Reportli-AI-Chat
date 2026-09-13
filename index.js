@@ -1,3 +1,7 @@
+// ============================================================
+// REPORTLI AI — CHAT WORKER
+// ============================================================
+
 export default {
   async fetch(request, env) {
 
@@ -43,7 +47,7 @@ export default {
       try {
 
         // ----------------------------------------------------
-        // Read request
+        // Read request body
         // ----------------------------------------------------
 
         const body = await request.json();
@@ -97,7 +101,7 @@ export default {
         // TEMPORARY TEST REPLY
         // ----------------------------------------------------
         //
-        // Replace this section with your actual AI call later.
+        // Replace this with your real AI call later.
         //
 
         const reply =
@@ -105,96 +109,232 @@ export default {
 
 
         // ====================================================
-        // SAVE AI REPLY TO SUPABASE
+        // FIND EXISTING QUESTION ROW
         // ====================================================
 
-        const messageId =
-          `msg_${crypto.randomUUID()}`;
+        // We look for the row that the FRONTEND already created.
+        //
+        // It must match:
+        //
+        // user_id
+        // application_id
+        // conversation_id
+        // question
+        //
+        // And reply must still be NULL.
+        //
+
+        const params = new URLSearchParams();
+
+        params.set(
+          "user_id",
+          `eq.${user_id}`
+        );
+
+        params.set(
+          "application_id",
+          `eq.${application_id}`
+        );
+
+        params.set(
+          "conversation_id",
+          `eq.${conversation_id}`
+        );
+
+        params.set(
+          "question",
+          `eq.${question.trim()}`
+        );
+
+        params.set(
+          "reply",
+          "is.null"
+        );
+
+        params.set(
+          "select",
+          "id,user_id,application_id,conversation_id,role,question,reply,created_at"
+        );
+
+        params.set(
+          "order",
+          "created_at.desc"
+        );
+
+        params.set(
+          "limit",
+          "1"
+        );
 
 
-        const supabaseResponse = await fetch(
-          `${env.SUPABASE_URL}/rest/v1/chat_messages`,
+        const findResponse = await fetch(
+
+          `${env.SUPABASE_URL}/rest/v1/chat_messages?${params.toString()}`,
+
           {
-            method: "POST",
+            method: "GET",
 
             headers: {
-              "Content-Type": "application/json",
 
               "apikey":
                 env.SUPABASE_SERVICE_ROLE_KEY,
 
               "Authorization":
-                `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`
 
-              "Prefer":
-                "return=representation"
-            },
-
-            body: JSON.stringify({
-
-              // ------------------------------------------------
-              // Message information
-              // ------------------------------------------------
-
-              id: messageId,
-
-              user_id: user_id,
-
-              application_id: application_id,
-
-              conversation_id: conversation_id,
-
-              // ------------------------------------------------
-              // This is an AI message
-              // ------------------------------------------------
-
-              role: "AI",
-
-              // ------------------------------------------------
-              // IMPORTANT:
-              //
-              // The frontend already saved the question.
-              // Therefore the Worker does NOT save question.
-              // ------------------------------------------------
-
-              question: null,
-
-              // ------------------------------------------------
-              // Save only the AI reply
-              // ------------------------------------------------
-
-              reply: reply
-
-            })
+            }
           }
+
         );
 
 
         // ====================================================
-        // SUPABASE RESPONSE
+        // READ FIND RESPONSE
         // ====================================================
 
-        const supabaseText =
-          await supabaseResponse.text();
+        const findText =
+          await findResponse.text();
 
 
         // ====================================================
-        // SUPABASE ERROR
+        // FIND ERROR
         // ====================================================
 
-        if (!supabaseResponse.ok) {
+        if (!findResponse.ok) {
 
           return json({
 
             success: false,
 
-            error: "Failed to save AI reply to Supabase",
+            error:
+              "Failed to find existing question",
 
             supabase_status:
-              supabaseResponse.status,
+              findResponse.status,
 
             details:
-              supabaseText
+              findText
+
+          }, 500);
+
+        }
+
+
+        let questionRows;
+
+        try {
+
+          questionRows =
+            JSON.parse(findText);
+
+        } catch {
+
+          questionRows = [];
+
+        }
+
+
+        // ====================================================
+        // QUESTION ROW NOT FOUND
+        // ====================================================
+
+        if (
+          !Array.isArray(questionRows) ||
+          questionRows.length === 0
+        ) {
+
+          return json({
+
+            success: false,
+
+            error:
+              "Existing question row was not found"
+
+          }, 404);
+
+        }
+
+
+        // ====================================================
+        // GET EXISTING ROW ID
+        // ====================================================
+
+        const existingMessage =
+          questionRows[0];
+
+        const messageId =
+          existingMessage.id;
+
+
+        // ====================================================
+        // UPDATE EXISTING ROW
+        // ====================================================
+
+        const updateResponse = await fetch(
+
+          `${env.SUPABASE_URL}/rest/v1/chat_messages?id=eq.${encodeURIComponent(messageId)}`,
+
+          {
+            method: "PATCH",
+
+            headers: {
+
+              "Content-Type":
+                "application/json",
+
+              "apikey":
+                env.SUPABASE_SERVICE_ROLE_KEY,
+
+              "Authorization":
+                `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY`,
+
+              "Prefer":
+                "return=representation"
+
+            },
+
+            body: JSON.stringify({
+
+              // ------------------------------------------------
+              // Keep the existing question.
+              // Only add the AI reply.
+              // ------------------------------------------------
+
+              reply: reply
+
+            })
+
+          }
+
+        );
+
+
+        // ====================================================
+        // READ UPDATE RESPONSE
+        // ====================================================
+
+        const updateText =
+          await updateResponse.text();
+
+
+        // ====================================================
+        // UPDATE ERROR
+        // ====================================================
+
+        if (!updateResponse.ok) {
+
+          return json({
+
+            success: false,
+
+            error:
+              "Failed to update AI reply",
+
+            supabase_status:
+              updateResponse.status,
+
+            details:
+              updateText
 
           }, 500);
 
@@ -202,26 +342,26 @@ export default {
 
 
         // ====================================================
-        // PARSE SAVED MESSAGE
+        // PARSE UPDATED ROW
         // ====================================================
 
-        let savedMessage;
+        let updatedMessage;
 
         try {
 
-          savedMessage =
-            JSON.parse(supabaseText);
+          updatedMessage =
+            JSON.parse(updateText);
 
         } catch {
 
-          savedMessage =
-            supabaseText;
+          updatedMessage =
+            updateText;
 
         }
 
 
         // ====================================================
-        // RETURN REPLY TO FRONTEND
+        // SUCCESS
         // ====================================================
 
         return json({
@@ -230,7 +370,7 @@ export default {
 
           reply: reply,
 
-          message: savedMessage
+          message: updatedMessage
 
         });
 
@@ -245,7 +385,8 @@ export default {
 
           success: false,
 
-          error: error.message || "Unknown error"
+          error:
+            error.message || "Unknown error"
 
         }, 500);
 
@@ -318,4 +459,4 @@ function json(data, status = 200) {
 
   );
 
-    }
+          }
