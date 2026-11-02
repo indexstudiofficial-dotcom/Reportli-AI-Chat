@@ -427,24 +427,31 @@ async function callSarvam(env, systemPrompt, userContent, maxTokens = 1500) {
     throw new Error("Missing SARVAM_API_KEY secret.");
   }
 
+  // sarvam-105b is a reasoning model. Hidden "thinking" tokens count toward
+  // max_tokens, so with reasoning on, a long prompt can use the whole budget
+  // and return content: null (finish_reason: "length"). Our prompts are
+  // already-summarized data, so reasoning is switched off (null) for speed
+  // and reliability.
   const payload = {
     model: SARVAM_MODEL,
     messages: [
       { role: "system", content: systemPrompt },
       { role: "user", content: userContent },
     ],
-    reasoning_effort: "low",
+    reasoning_effort: null,
     temperature: 0.2,
     max_tokens: maxTokens,
   };
 
   let { response, text, result } = await sarvamFetch(env, payload);
 
+  // If the API rejects reasoning_effort: null, use "low" with a bigger budget.
   if (
     (response.status === 400 || response.status === 422) &&
     /reasoning/i.test(text)
   ) {
-    delete payload.reasoning_effort;
+    payload.reasoning_effort = "low";
+    payload.max_tokens = maxTokens * 3;
     ({ response, text, result } = await sarvamFetch(env, payload));
   }
 
@@ -452,8 +459,21 @@ async function callSarvam(env, systemPrompt, userContent, maxTokens = 1500) {
     throw new Error(`Sarvam ${response.status}: ${truncate(text, 300)}`);
   }
 
-  const choice = result?.choices?.[0];
-  const content = stripThinking(choice?.message?.content || "");
+  let choice = result?.choices?.[0];
+  let content = stripThinking(choice?.message?.content || "");
+
+  // Cut off before any answer text: retry once with a much larger budget.
+  if (!content && choice?.finish_reason === "length") {
+    payload.max_tokens = maxTokens * 3;
+    ({ response, text, result } = await sarvamFetch(env, payload));
+
+    if (!response.ok) {
+      throw new Error(`Sarvam ${response.status}: ${truncate(text, 300)}`);
+    }
+
+    choice = result?.choices?.[0];
+    content = stripThinking(choice?.message?.content || "");
+  }
 
   if (!content) {
     throw new Error(
