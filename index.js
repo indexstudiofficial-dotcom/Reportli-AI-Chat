@@ -38,6 +38,14 @@ const INCLUDE_EMAIL_SNIPPETS = false;
 const ACTIVITY_DAYS = 7;
 const RECENT_DAYS = 30;
 
+// Set true only if you have a separate `errors` table.
+// Error events are already counted from user_activity either way.
+const ENABLE_ERRORS_TABLE = false;
+
+function usableSources(sources) {
+  return sources.filter((s) => s !== "errors" || ENABLE_ERRORS_TABLE);
+}
+
 // Row limits per source
 const LIMITS = {
   activity: 5000,
@@ -255,18 +263,38 @@ async function saveReply(env, messageId, reply) {
 }
 
 // application_id + user_id must match. api_key stays server-side only.
-async function verifyApplication(env, applicationId, userId) {
-  const applications = await supabaseRequest(
-    env,
-    `applications?id=eq.${encodeURIComponent(applicationId)}` +
-      `&user_id=eq.${encodeURIComponent(userId)}&select=*&limit=1`
-  );
+//
+// If there is no usable `applications` table (missing table, different
+// column names, uuid vs text ids), we fall back to checking that the
+// chat_messages row itself belongs to this user and application. That row
+// is created by your app before the Worker is called.
+async function verifyApplication(env, applicationId, userId, messageId) {
+  try {
+    const applications = await supabaseRequest(
+      env,
+      `applications?id=eq.${encodeURIComponent(applicationId)}` +
+        `&user_id=eq.${encodeURIComponent(userId)}&select=*&limit=1`
+    );
 
-  if (!Array.isArray(applications) || applications.length === 0) {
-    return null;
+    if (Array.isArray(applications) && applications.length > 0) {
+      return { ...applications[0], user_id: userId };
+    }
+  } catch (error) {
+    console.error("APPLICATIONS LOOKUP FAILED, using chat message check:", error);
   }
 
-  return applications[0];
+  const rows = await supabaseRequest(
+    env,
+    `chat_messages?id=eq.${encodeURIComponent(messageId)}` +
+      `&user_id=eq.${encodeURIComponent(userId)}` +
+      `&application_id=eq.${encodeURIComponent(applicationId)}&select=id&limit=1`
+  );
+
+  if (Array.isArray(rows) && rows.length > 0) {
+    return { id: applicationId, name: null, api_key: null, user_id: userId };
+  }
+
+  return null;
 }
 
 
@@ -501,6 +529,11 @@ async function loadData(env, application, sources) {
   const appId = encodeURIComponent(application.id);
   const apiKey = application.api_key ? encodeURIComponent(application.api_key) : null;
 
+  // Prefer the app's api_key. Without it, fall back to the owner's user_id.
+  const ownerFilter = apiKey
+    ? `api_key=eq.${apiKey}`
+    : `user_id=eq.${encodeURIComponent(application.user_id || "")}`;
+
   const since7 = encodeURIComponent(daysAgoISO(ACTIVITY_DAYS));
   const since30 = encodeURIComponent(daysAgoISO(RECENT_DAYS));
   const until = encodeURIComponent(new Date().toISOString());
@@ -509,27 +542,23 @@ async function loadData(env, application, sources) {
 
   // ---------- Product analytics (keyed by api_key) ----------
   if (sources.includes("activity")) {
-    jobs.activity = apiKey
-      ? safeFetch(
-          env,
-          "Product activity",
-          `user_activity?api_key=eq.${apiKey}&time=gte.${since7}&time=lte.${until}` +
-            `&select=id,user_id,session_id,time,event&order=time.desc&limit=${LIMITS.activity}`,
-          warnings
-        )
-      : Promise.resolve([]);
+    jobs.activity = safeFetch(
+      env,
+      "Product activity",
+      `user_activity?${ownerFilter}&time=gte.${since7}&time=lte.${until}` +
+        `&select=id,user_id,session_id,time,event&order=time.desc&limit=${LIMITS.activity}`,
+      warnings
+    );
   }
 
   if (sources.includes("errors")) {
-    jobs.errors = apiKey
-      ? safeFetch(
-          env,
-          "Errors",
-          `errors?api_key=eq.${apiKey}&timestamp=gte.${since7}&timestamp=lte.${until}` +
-            `&select=id,error_message,timestamp,user_id,ai_analysis&order=timestamp.desc&limit=${LIMITS.errors}`,
-          warnings
-        )
-      : Promise.resolve([]);
+    jobs.errors = safeFetch(
+      env,
+      "Errors",
+      `errors?${ownerFilter}&timestamp=gte.${since7}&timestamp=lte.${until}` +
+        `&select=id,error_message,timestamp,user_id,ai_analysis&order=timestamp.desc&limit=${LIMITS.errors}`,
+      warnings
+    );
   }
 
   // ---------- Growth data (keyed by application_id) ----------
@@ -994,7 +1023,7 @@ async function handleRequest(request, env) {
 
   try {
     // 1. Verify application ownership
-    const application = await verifyApplication(env, applicationId, userId);
+    const application = await verifyApplication(env, applicationId, userId, messageId);
 
     if (!application) {
       const reply = "I couldn't verify this SaaS application.";
@@ -1007,14 +1036,15 @@ async function handleRequest(request, env) {
     // ========================================================
     if (taskName) {
       const task = TASKS[taskName];
-      const data = await loadData(env, application, task.sources);
+      const taskSources = usableSources(task.sources);
+      const data = await loadData(env, application, taskSources);
 
       const reply = await analyzeQuestion(
         env,
         question,
         application,
         [],
-        task.sources,
+        taskSources,
         data,
         task.instructions
       );
@@ -1027,7 +1057,7 @@ async function handleRequest(request, env) {
         classification: "TASK",
         task: taskName,
         label: task.label,
-        sources: task.sources,
+        sources: taskSources,
         ai_calls: 1,
       });
     }
@@ -1054,7 +1084,7 @@ async function handleRequest(request, env) {
     }
 
     // 5. NEED_WORK -> fetch only the needed tables
-    const sources = classification.sources;
+    const sources = usableSources(classification.sources);
     const data = await loadData(env, application, sources);
 
     // 6. Analyst -> 2 AI calls total
