@@ -1,16 +1,19 @@
 // ============================================================
-// REPORTLI AI — AI CO-FOUNDER CHAT WORKER (v2, multi-source)
+// REPORTLI AI — AI CO-FOUNDER CHAT WORKER (v3)
 // ============================================================
 //
-// FLOW:
-//   User -> Worker -> verify app -> load chat history
-//     -> CLASSIFIER AI (NO_WORK or NEED_WORK + which sources)
-//     NO_WORK   -> save classifier reply
-//     NEED_WORK -> fetch ONLY the needed tables -> summarize
-//               -> ANALYST AI -> save reply
+// TWO WAYS TO CALL IT:
 //
-// REQUEST:
-//   { id, user_id, application_id, question }
+// 1) Free-typed question (classifier picks the data):
+//    { id, user_id, application_id, question }
+//
+// 2) One-tap task button (skips the classifier, 1 AI call):
+//    { id, user_id, application_id, task }
+//
+//    task = generate_weekly_report | analyze_user_behavior
+//           | check_lead_status | find_reddit_opportunities
+//
+// 3) GET (any path) returns the task list: [{ id, label, description }]
 //
 // REQUIRED WORKER SECRETS:
 //   SUPABASE_URL
@@ -18,11 +21,8 @@
 //   SARVAM_API_KEY
 //
 // SECURITY:
-//   - Every query selects explicit columns. Secrets such as
-//     applications.api_key and gmail connected_account_id are
-//     NEVER sent to the AI.
-//   - Lead email addresses and email bodies are NOT sent unless
-//     you enable the flags below.
+//   Every query selects explicit columns. api_key, connected_account_id,
+//   lead emails and email bodies are never sent to the AI.
 // ============================================================
 
 const SARVAM_URL = "https://api.sarvam.ai/v1/chat/completions";
@@ -34,10 +34,20 @@ const DEBUG = true; // set false once stable
 const INCLUDE_LEAD_EMAILS = false;
 const INCLUDE_EMAIL_SNIPPETS = false;
 
-// Limits
+// Time windows
 const ACTIVITY_DAYS = 7;
 const RECENT_DAYS = 30;
-const MAX_ROWS = 2000;
+
+// Row limits per source
+const LIMITS = {
+  activity: 5000,
+  errors: 1000,
+  leads: 2000,
+  emails: 500,
+  reddit: 300,
+  niches: 200,
+  planner: 100,
+};
 
 const VALID_SOURCES = [
   "activity",
@@ -51,6 +61,69 @@ const VALID_SOURCES = [
 
 
 // ============================================================
+// BUILT-IN TASKS (one-tap buttons)
+// ============================================================
+
+const TASKS = {
+  generate_weekly_report: {
+    label: "Generate weekly report",
+    description: "Sessions, top actions and errors from the last 7 days.",
+    aliases: ["weekly_report"],
+    sources: ["activity", "errors"],
+    question: "Generate my weekly report.",
+    instructions:
+      "Write a weekly report for the last 7 days: total sessions, the busiest day, the most common user actions, and any errors. " +
+      "Point out the single biggest change or concern, then give one next step. Max 120 words.",
+  },
+
+  analyze_user_behavior: {
+    label: "Analyze user behavior",
+    description: "What users click, how long sessions last, and where they drop off.",
+    aliases: ["user_behavior"],
+    sources: ["activity"],
+    question: "Analyze what my users are doing in my product.",
+    instructions:
+      "Explain how users behave in their sessions: which buttons or features they click most, how many actions a typical session has, " +
+      "how long sessions last, what share of sessions hit an error, and how many sessions end after a single action. " +
+      "End with one product improvement to try. Max 120 words.",
+  },
+
+  check_lead_status: {
+    label: "Check lead status",
+    description: "Lead pipeline, reply status, and inbox emails that need attention.",
+    aliases: ["lead_status"],
+    sources: ["leads", "emails"],
+    question: "Check the status of my leads.",
+    instructions:
+      "Summarize the lead pipeline: how many leads, how many have valid emails, the reply_status breakdown, and which job titles or companies dominate. " +
+      "Note that a lead's message is the outreach email we wrote, not a reply from the lead. " +
+      "If inbox emails need a reply and have no draft, mention it. End with who or what to follow up on first. Max 120 words.",
+  },
+
+  find_reddit_opportunities: {
+    label: "Find Reddit opportunities",
+    description: "The best Reddit posts to reply to and the hottest customer niche.",
+    aliases: ["reddit_opportunities"],
+    sources: ["reddit", "niches"],
+    question: "Find my best Reddit opportunities.",
+    instructions:
+      "Name the 3 best Reddit posts to reply to, with subreddit, why each is a fit (use the post snippet), and its relevance score. " +
+      "Then say which customer niche looks hottest using buying intention and post counts. Max 140 words.",
+  },
+};
+
+
+// Accepts the task id or an old alias, returns the task id (or null).
+function resolveTask(name) {
+  const key = String(name || "").trim().toLowerCase();
+  if (TASKS[key]) return key;
+  return (
+    Object.keys(TASKS).find((k) => (TASKS[k].aliases || []).includes(key)) || null
+  );
+}
+
+
+// ============================================================
 // HELPERS
 // ============================================================
 
@@ -58,7 +131,7 @@ function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Content-Type",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Content-Type": "application/json",
   };
 }
@@ -244,10 +317,10 @@ You are Reportli AI's classifier.
 Decide if the founder's question needs data from their SaaS workspace.
 
 NO_WORK = greetings, casual talk, thanks, or general help that needs no data.
-NEED_WORK = anything about their numbers, activity, leads, emails, Reddit research, niches, errors, or automation runs.
+NEED_WORK = anything about their numbers, user activity, leads, emails, Reddit research, niches, errors, or automation runs.
 
 Available data sources:
-- activity: product sessions and events (last 7 days)
+- activity: product sessions and user actions such as clicks (last 7 days)
 - errors: application errors (last 7 days)
 - leads: outbound leads, job titles, companies, email status, reply status
 - emails: Gmail inbox processing, categories, AI draft replies, failures
@@ -276,8 +349,10 @@ Rules:
 - Never invent numbers, customers, revenue, percentages, or data.
 - Sessions are NOT unique customers.
 - Only sources listed in sources_loaded were fetched. For anything else, say you didn't check it.
-- product activity and errors cover the last 7 days. Other sources cover the most recent rows; if a section says truncated=true, say the figures are for the latest rows only.
-- If data is empty, insufficient, or in data_warnings, say so plainly.
+- Product activity and errors cover the last 7 days. Other sources cover the most recent rows; if a section says truncated=true, say the figures are for the latest rows only.
+- A lead's outreach message is the email we wrote to them, not a reply from them. reply_status shows the outcome.
+- If data is empty or insufficient, say so plainly. If data_warnings lists a problem, mention it briefly.
+- If task_instructions is present, follow it exactly, including the word limit.
 - Use recent_conversation to understand follow-up questions.
 - Give concise, founder-level insights: what the numbers mean and why it matters.
 - Give one practical next step when useful.
@@ -439,7 +514,7 @@ async function loadData(env, application, sources) {
           env,
           "Product activity",
           `user_activity?api_key=eq.${apiKey}&time=gte.${since7}&time=lte.${until}` +
-            `&select=id,user_id,session_id,time,event&order=time.desc&limit=5000`,
+            `&select=id,user_id,session_id,time,event&order=time.desc&limit=${LIMITS.activity}`,
           warnings
         )
       : Promise.resolve([]);
@@ -451,7 +526,7 @@ async function loadData(env, application, sources) {
           env,
           "Errors",
           `errors?api_key=eq.${apiKey}&timestamp=gte.${since7}&timestamp=lte.${until}` +
-            `&select=id,error_message,timestamp,user_id,ai_analysis&order=timestamp.desc&limit=${MAX_ROWS}`,
+            `&select=id,error_message,timestamp,user_id,ai_analysis&order=timestamp.desc&limit=${LIMITS.errors}`,
           warnings
         )
       : Promise.resolve([]);
@@ -465,7 +540,7 @@ async function loadData(env, application, sources) {
       `leads?application_id=eq.${appId}` +
         `&select=id,task_id,full_name,job_title,company_name,company_domain,email_status,reply_status,message,created_at` +
         (INCLUDE_LEAD_EMAILS ? ",email" : "") +
-        `&order=created_at.desc&limit=${MAX_ROWS}`,
+        `&order=created_at.desc&limit=${LIMITS.leads}`,
       warnings
     );
   }
@@ -475,9 +550,9 @@ async function loadData(env, application, sources) {
       env,
       "Email processing",
       `gmail_processed_messages?application_id=eq.${appId}&created_at=gte.${since30}` +
-        `&select=id,sender_name,email_category,should_reply,gmail_draft_id,status,error_message,email_received_at,processed_at,created_at` +
+        `&select=id,sender_name,email_category,should_reply,ai_draft_reply,gmail_draft_id,status,error_message,email_received_at,processed_at,created_at` +
         (INCLUDE_EMAIL_SNIPPETS ? ",email_content" : "") +
-        `&order=created_at.desc&limit=${MAX_ROWS}`,
+        `&order=created_at.desc&limit=${LIMITS.emails}`,
       warnings
     );
   }
@@ -487,8 +562,8 @@ async function loadData(env, application, sources) {
       env,
       "Reddit research",
       `reddit_research_results?application_id=eq.${appId}&created_at=gte.${since30}` +
-        `&select=id,subreddit,title,post_url,created_utc,score,num_comments,customer_niche,matched_query,relevance_score,created_at` +
-        `&order=created_at.desc&limit=${MAX_ROWS}`,
+        `&select=id,subreddit,title,post_text,post_url,author_username,created_utc,score,num_comments,customer_niche,matched_query,relevance_score,created_at` +
+        `&order=created_at.desc&limit=${LIMITS.reddit}`,
       warnings
     );
   }
@@ -499,7 +574,7 @@ async function loadData(env, application, sources) {
       "Customer niches",
       `customer_niches?application_id=eq.${appId}` +
         `&select=niche_name,buying_intention,reddit_status,apollo_status,created_at` +
-        `&order=buying_intention.desc.nullslast&limit=200`,
+        `&order=buying_intention.desc.nullslast&limit=${LIMITS.niches}`,
       warnings
     );
   }
@@ -510,7 +585,7 @@ async function loadData(env, application, sources) {
       "Planner runs",
       `planner_runs?application_id=eq.${appId}` +
         `&select=worker_type,source,task,status,pending_count,error,niche,created_at,started_at` +
-        `&order=created_at.desc&limit=100`,
+        `&order=created_at.desc&limit=${LIMITS.planner}`,
       warnings
     );
   }
@@ -534,50 +609,154 @@ async function loadData(env, application, sources) {
 
 
 // ============================================================
+// EVENT PARSER
+// ============================================================
+//
+// user_activity.event arrives in several shapes:
+//   "\"09:52 pm   Clicked \\\"Reports Center\\\"\""   (string wrapped in quotes)
+//   "\"12:15 pm   Error occurred\""
+//   {"message":"10:37 pm   Session started","event_name":"SESSION_STARTED"}
+//
+// This turns every shape into { type, target, message }.
+// ============================================================
+
+function parseEvent(raw) {
+  let ev = raw;
+
+  // Unwrap JSON-encoded strings / objects (up to 2 layers).
+  for (let i = 0; i < 2; i++) {
+    if (typeof ev !== "string") break;
+    const t = ev.trim();
+    if (t.startsWith("{") || t.startsWith('"')) {
+      try {
+        ev = JSON.parse(t);
+        continue;
+      } catch {
+        // fall through
+      }
+    }
+    break;
+  }
+
+  let message = "";
+  let name = "";
+
+  if (ev && typeof ev === "object") {
+    message = String(ev.message || "");
+    name = String(ev.event_name || ev.name || ev.event || ev.type || "");
+  } else {
+    message = String(ev ?? "");
+  }
+
+  // Remove leading clock time like "09:52 pm   "
+  message = message
+    .replace(/^\s*\d{1,2}:\d{2}\s*(am|pm)?\s*/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const probe = `${name} ${message}`;
+
+  if (/session[_ ]?start/i.test(probe)) {
+    return { type: "SESSION_STARTED", target: null, message };
+  }
+
+  if (/click/i.test(probe)) {
+    const m = message.match(/^clicked\s+(.*)$/i);
+    const target = (m ? m[1] : message).replace(/^["'\\]+|["'\\]+$/g, "").trim();
+    return { type: "CLICK", target: truncate(target, 80) || "unknown", message };
+  }
+
+  if (/error/i.test(probe)) {
+    return { type: "ERROR", target: null, message };
+  }
+
+  if (name) {
+    return { type: name.toUpperCase().replace(/\s+/g, "_"), target: null, message };
+  }
+
+  return { type: "OTHER", target: null, message };
+}
+
+
+// ============================================================
 // SUMMARIES (compact, so the prompt stays small)
 // ============================================================
 
-function getEventName(event) {
-  if (typeof event === "string") return event;
-  if (event && typeof event === "object") {
-    return String(event.name || event.event || event.type || "unknown");
-  }
-  return "unknown";
-}
-
 function summarizeActivity(activity) {
-  const sessions = new Set();
+  const sessions = new Map(); // id -> { events, errors, first, last }
+  const typeCounts = {};
+  const clickCounts = {};
+  const otherCounts = {};
   const daily = {};
 
   for (const row of activity) {
-    if (row.session_id) sessions.add(String(row.session_id));
+    const ev = parseEvent(row.event);
 
-    if (row.time) {
-      const d = new Date(row.time);
-      if (!isNaN(d.getTime())) {
-        const date = d.toISOString().slice(0, 10);
+    typeCounts[ev.type] = (typeCounts[ev.type] || 0) + 1;
+    if (ev.type === "CLICK") clickCounts[ev.target] = (clickCounts[ev.target] || 0) + 1;
+    if (ev.type === "OTHER" && ev.message) {
+      const k = truncate(ev.message, 60);
+      otherCounts[k] = (otherCounts[k] || 0) + 1;
+    }
+
+    const t = row.time ? new Date(row.time).getTime() : NaN;
+
+    if (row.session_id) {
+      const id = String(row.session_id);
+      if (!sessions.has(id)) sessions.set(id, { events: 0, errors: 0, clicks: 0, first: Infinity, last: -Infinity });
+      const s = sessions.get(id);
+      s.events++;
+      if (ev.type === "ERROR") s.errors++;
+      if (ev.type === "CLICK") s.clicks++;
+      if (!isNaN(t)) {
+        s.first = Math.min(s.first, t);
+        s.last = Math.max(s.last, t);
+      }
+
+      if (!isNaN(t)) {
+        const date = new Date(t).toISOString().slice(0, 10);
         if (!daily[date]) daily[date] = new Set();
-        if (row.session_id) daily[date].add(String(row.session_id));
+        daily[date].add(id);
       }
     }
   }
 
+  const list = [...sessions.values()];
+  const total = list.length;
+
+  const multi = list.filter((s) => s.events > 1 && isFinite(s.first) && isFinite(s.last));
+  const avgMinutes = multi.length
+    ? Math.round((multi.reduce((sum, s) => sum + (s.last - s.first), 0) / multi.length / 60000) * 10) / 10
+    : null;
+
+  const dailySessions = Object.entries(daily)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([date, set]) => ({ date, sessions: set.size }));
+
+  const busiest = [...dailySessions].sort((a, b) => b.sessions - a.sessions)[0] || null;
+
   return {
     period: `last ${ACTIVITY_DAYS} days`,
-    truncated: activity.length >= 5000,
+    truncated: activity.length >= LIMITS.activity,
     total_activity_rows: activity.length,
-    total_sessions_with_session_id: sessions.size,
-    top_events: topList(countBy(activity, (r) => getEventName(r.event)), "event", 20),
-    daily_sessions: Object.entries(daily)
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([date, set]) => ({ date, sessions: set.size })),
+    total_sessions: total,
+    avg_actions_per_session: total ? Math.round((activity.length / total) * 10) / 10 : null,
+    avg_session_minutes: avgMinutes,
+    single_action_sessions: list.filter((s) => s.events === 1).length,
+    sessions_with_clicks: list.filter((s) => s.clicks > 0).length,
+    sessions_with_errors: list.filter((s) => s.errors > 0).length,
+    busiest_day: busiest,
+    daily_sessions: dailySessions,
+    action_types: typeCounts,
+    top_clicked_elements: topList(clickCounts, "element", 12),
+    other_actions: topList(otherCounts, "action", 8),
   };
 }
 
 function summarizeErrors(errors) {
   return {
     period: `last ${ACTIVITY_DAYS} days`,
-    truncated: errors.length >= MAX_ROWS,
+    truncated: errors.length >= LIMITS.errors,
     total_errors: errors.length,
     top_errors: topList(countBy(errors, (e) => e.error_message || "Unknown error"), "error", 15),
     recent_errors: errors.slice(0, 10).map((e) => ({
@@ -589,13 +768,16 @@ function summarizeErrors(errors) {
 }
 
 function summarizeLeads(leads) {
+  const pending = leads.filter((l) => String(l.reply_status || "").toLowerCase() === "pending").length;
+
   return {
     scope: "all time, latest rows",
-    truncated: leads.length >= MAX_ROWS,
+    truncated: leads.length >= LIMITS.leads,
     total_leads: leads.length,
-    by_email_status: countBy(leads, (l) => l.email_status || "unknown"),
-    by_reply_status: countBy(leads, (l) => l.reply_status || "no_status"),
-    leads_with_reply_message: leads.filter((l) => l.message).length,
+    by_email_status: countBy(leads, (l) => String(l.email_status || "unknown").toLowerCase()),
+    by_reply_status: countBy(leads, (l) => String(l.reply_status || "no_status").toLowerCase()),
+    awaiting_reply: pending,
+    outreach_messages_written: leads.filter((l) => l.message).length,
     top_companies: topList(countBy(leads, (l) => l.company_name || "unknown"), "company", 10),
     top_job_titles: topList(countBy(leads, (l) => l.job_title || "unknown"), "job_title", 10),
     leads_added_per_day_last_14d: dailyCounts(leads, "created_at", 14),
@@ -608,14 +790,6 @@ function summarizeLeads(leads) {
       added: l.created_at,
       ...(INCLUDE_LEAD_EMAILS ? { email: l.email } : {}),
     })),
-    recent_replies: leads
-      .filter((l) => l.message)
-      .slice(0, 5)
-      .map((l) => ({
-        from: l.full_name || l.company_name || "unknown",
-        reply_status: l.reply_status || null,
-        message: truncate(l.message, 250),
-      })),
   };
 }
 
@@ -624,12 +798,14 @@ function summarizeEmails(emails) {
 
   return {
     period: `last ${RECENT_DAYS} days`,
-    truncated: emails.length >= MAX_ROWS,
+    truncated: emails.length >= LIMITS.emails,
     total_emails_processed: emails.length,
-    by_status: countBy(emails, (e) => e.status || "unknown"),
+    by_status: countBy(emails, (e) => String(e.status || "unknown").toLowerCase()),
     by_category: countBy(emails, (e) => e.email_category || "uncategorized"),
     should_reply_count: emails.filter((e) => e.should_reply === true).length,
-    ai_drafts_created: emails.filter((e) => e.gmail_draft_id).length,
+    ai_drafts_written: emails.filter((e) => e.ai_draft_reply).length,
+    drafts_saved_to_gmail: emails.filter((e) => e.gmail_draft_id).length,
+    need_reply_but_no_draft: emails.filter((e) => e.should_reply === true && !e.ai_draft_reply).length,
     failed_count: failed.length,
     top_failure_reasons: topList(countBy(failed, (e) => e.error_message), "error", 5),
     emails_per_day_last_14d: dailyCounts(emails, "created_at", 14),
@@ -637,8 +813,8 @@ function summarizeEmails(emails) {
       sender: e.sender_name || null,
       category: e.email_category || null,
       should_reply: e.should_reply,
-      status: e.status,
-      draft_created: Boolean(e.gmail_draft_id),
+      status: String(e.status || "").toLowerCase(),
+      draft_written: Boolean(e.ai_draft_reply),
       received: e.email_received_at || null,
       ...(INCLUDE_EMAIL_SNIPPETS ? { snippet: truncate(e.email_content, 120) } : {}),
     })),
@@ -653,7 +829,7 @@ function summarizeReddit(posts) {
 
   return {
     period: `last ${RECENT_DAYS} days`,
-    truncated: posts.length >= MAX_ROWS,
+    truncated: posts.length >= LIMITS.reddit,
     total_posts_found: posts.length,
     average_relevance_score: avg,
     by_subreddit: topList(countBy(posts, (p) => p.subreddit || "unknown"), "subreddit", 10),
@@ -661,16 +837,17 @@ function summarizeReddit(posts) {
     top_queries: topList(countBy(posts, (p) => p.matched_query || "unknown"), "query", 10),
     top_posts_by_relevance: [...scored]
       .sort((a, b) => b.relevance_score - a.relevance_score)
-      .slice(0, 8)
+      .slice(0, 6)
       .map((p) => ({
         title: truncate(p.title, 150),
+        snippet: truncate(p.post_text, 220),
         subreddit: p.subreddit,
+        author: p.author_username || null,
         relevance_score: p.relevance_score,
         reddit_score: p.score ?? null,
         comments: p.num_comments ?? null,
         niche: p.customer_niche || null,
         url: p.post_url,
-        posted: p.created_utc ? new Date(p.created_utc * 1000).toISOString() : null,
       })),
   };
 }
@@ -737,9 +914,10 @@ function buildSummary(data, sources) {
 // ANALYST
 // ============================================================
 
-async function analyzeQuestion(env, question, application, history, sources, data) {
+async function analyzeQuestion(env, question, application, history, sources, data, instructions = null) {
   const prompt = JSON.stringify({
     founder_question: question,
+    ...(instructions ? { task_instructions: instructions } : {}),
     recent_conversation: history,
     application: { name: application.name || null },
     sources_loaded: sources,
@@ -760,6 +938,15 @@ function validateRequest(body) {
   if (!body.id) return "Missing id.";
   if (!body.user_id) return "Missing user_id.";
   if (!body.application_id) return "Missing application_id.";
+
+  // A task button doesn't need a question.
+  if (body.task) {
+    if (!resolveTask(body.task)) {
+      return `Unknown task. Use one of: ${Object.keys(TASKS).join(", ")}.`;
+    }
+    return null;
+  }
+
   if (!body.question) return "Missing question.";
   if (typeof body.question !== "string") return "Question must be a string.";
   if (body.question.trim().length === 0) return "Question cannot be empty.";
@@ -772,6 +959,17 @@ function validateRequest(body) {
 // ============================================================
 
 async function handleRequest(request, env) {
+  // GET returns the button list, so the app can build buttons from the Worker.
+  if (request.method === "GET") {
+    return json({
+      tasks: Object.entries(TASKS).map(([id, t]) => ({
+        id,
+        label: t.label,
+        description: t.description,
+      })),
+    });
+  }
+
   if (request.method !== "POST") {
     return json({ error: "Method not allowed." }, 405);
   }
@@ -791,7 +989,8 @@ async function handleRequest(request, env) {
   const messageId = String(body.id);
   const userId = String(body.user_id);
   const applicationId = String(body.application_id);
-  const question = String(body.question).trim();
+  const taskName = body.task ? resolveTask(body.task) : null;
+  const question = taskName ? TASKS[taskName].question : String(body.question).trim();
 
   try {
     // 1. Verify application ownership
@@ -802,6 +1001,40 @@ async function handleRequest(request, env) {
       await saveReply(env, messageId, reply);
       return json({ success: false, reply, classification: "ERROR" }, 403);
     }
+
+    // ========================================================
+    // TASK BUTTON PATH: no classifier, 1 AI call
+    // ========================================================
+    if (taskName) {
+      const task = TASKS[taskName];
+      const data = await loadData(env, application, task.sources);
+
+      const reply = await analyzeQuestion(
+        env,
+        question,
+        application,
+        [],
+        task.sources,
+        data,
+        task.instructions
+      );
+
+      await saveReply(env, messageId, reply);
+
+      return json({
+        success: true,
+        reply,
+        classification: "TASK",
+        task: taskName,
+        label: task.label,
+        sources: task.sources,
+        ai_calls: 1,
+      });
+    }
+
+    // ========================================================
+    // FREE-TYPED QUESTION PATH
+    // ========================================================
 
     // 2. Conversation memory
     const history = await getChatHistory(env, messageId, applicationId);
