@@ -1,5 +1,5 @@
 // ============================================================
-// REPORTLI AI — AI CO-FOUNDER CHAT WORKER (v3)
+// REPORTLI AI — AI CO-FOUNDER CHAT WORKER (v4, with credits)
 // ============================================================
 //
 // TWO WAYS TO CALL IT:
@@ -14,6 +14,12 @@
 //           | check_lead_status | find_reddit_opportunities
 //
 // 3) GET (any path) returns the task list: [{ id, label, description }]
+//
+// CREDITS:
+//   Each processed message costs 0.01 credits from users.balance.
+//   If balance < 0.01 the message is NOT processed and the
+//   "You're out of credits" reply is saved and returned.
+//   If processing fails after charging, the credit is refunded.
 //
 // REQUIRED WORKER SECRETS:
 //   SUPABASE_URL
@@ -41,6 +47,15 @@ const RECENT_DAYS = 30;
 // Set true only if you have a separate `errors` table.
 // Error events are already counted from user_activity either way.
 const ENABLE_ERRORS_TABLE = false;
+
+// ---------- Credits ----------
+const CREDIT_COST = 0.01;
+const USERS_TABLE = "users";
+const USERS_ID_COLUMN = "id"; // column in `users` that matches user_id
+const USERS_BALANCE_COLUMN = "balance";
+// Returned HTTP status when out of credits. Use 200 if your frontend
+// treats any non-200 response as a hard error.
+const OUT_OF_CREDITS_STATUS = 200;
 
 function usableSources(sources) {
   return sources.filter((s) => s !== "errors" || ENABLE_ERRORS_TABLE);
@@ -295,6 +310,97 @@ async function verifyApplication(env, applicationId, userId, messageId) {
   }
 
   return null;
+}
+
+
+// ============================================================
+// CREDITS
+// ============================================================
+
+const round4 = (n) => Math.round(n * 10000) / 10000;
+
+function outOfCreditsMessage(balance) {
+  return (
+    "You're out of credits\n\n" +
+    "You've used all your available credits. Upgrade your plan to continue using Reportli AI and keep your workflow running.\n\n" +
+    `Your balance: ${round4(Number(balance) || 0)} credits`
+  );
+}
+
+// Reads the balance. Returns null if the user row doesn't exist.
+async function readBalance(env, userId) {
+  const rows = await supabaseRequest(
+    env,
+    `${USERS_TABLE}?${USERS_ID_COLUMN}=eq.${encodeURIComponent(userId)}` +
+      `&select=${USERS_BALANCE_COLUMN}&limit=1`
+  );
+
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  return Number(rows[0][USERS_BALANCE_COLUMN]) || 0;
+}
+
+// Compare-and-swap: the PATCH only applies if the balance is still the
+// value we just read, so two simultaneous messages can't spend the same
+// credit. Returns the new balance, or null if the row changed.
+async function setBalanceIfUnchanged(env, userId, oldBalance, newBalance) {
+  const updated = await supabaseRequest(
+    env,
+    `${USERS_TABLE}?${USERS_ID_COLUMN}=eq.${encodeURIComponent(userId)}` +
+      `&${USERS_BALANCE_COLUMN}=eq.${oldBalance}`,
+    {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({ [USERS_BALANCE_COLUMN]: newBalance }),
+    }
+  );
+
+  return Array.isArray(updated) && updated.length > 0 ? newBalance : null;
+}
+
+// Checks the balance and deducts CREDIT_COST.
+// Returns { ok: true, balance } or { ok: false, balance }.
+async function chargeCredits(env, userId) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const balance = await readBalance(env, userId);
+
+    if (balance === null) {
+      console.error("CREDITS: user row not found for", userId);
+      return { ok: false, balance: 0 };
+    }
+
+    if (balance < CREDIT_COST - 1e-9) {
+      return { ok: false, balance };
+    }
+
+    const newBalance = round4(balance - CREDIT_COST);
+    const result = await setBalanceIfUnchanged(env, userId, balance, newBalance);
+
+    if (result !== null) return { ok: true, balance: result };
+    // Balance changed under us, retry with the fresh value.
+  }
+
+  throw new Error("Could not update credits. Please retry.");
+}
+
+// Gives the credit back if the request failed after we charged.
+async function refundCredits(env, userId) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const balance = await readBalance(env, userId);
+      if (balance === null) return;
+
+      const result = await setBalanceIfUnchanged(
+        env,
+        userId,
+        balance,
+        round4(balance + CREDIT_COST)
+      );
+      if (result !== null) return;
+    } catch (error) {
+      console.error("REFUND ERROR:", error);
+    }
+  }
+  console.error("REFUND FAILED after retries for user", userId);
 }
 
 
@@ -1041,6 +1147,9 @@ async function handleRequest(request, env) {
   const taskName = body.task ? resolveTask(body.task) : null;
   const question = taskName ? TASKS[taskName].question : String(body.question).trim();
 
+  // True once 0.01 credits have been deducted for this request.
+  let charged = false;
+
   try {
     // 1. Verify application ownership
     const application = await verifyApplication(env, applicationId, userId, messageId);
@@ -1050,6 +1159,24 @@ async function handleRequest(request, env) {
       await saveReply(env, messageId, reply);
       return json({ success: false, reply, classification: "ERROR" }, 403);
     }
+
+    // 1b. Credit check + deduct (before any AI work)
+    const credit = await chargeCredits(env, userId);
+
+    if (!credit.ok) {
+      const reply = outOfCreditsMessage(credit.balance);
+      await saveReply(env, messageId, reply);
+      return json(
+        {
+          success: false,
+          reply,
+          classification: "NO_CREDITS",
+          balance: credit.balance,
+        },
+        OUT_OF_CREDITS_STATUS
+      );
+    }
+    charged = true;
 
     // ========================================================
     // TASK BUTTON PATH: no classifier, 1 AI call
@@ -1079,6 +1206,7 @@ async function handleRequest(request, env) {
         label: task.label,
         sources: taskSources,
         ai_calls: 1,
+        balance: credit.balance,
       });
     }
 
@@ -1100,6 +1228,7 @@ async function handleRequest(request, env) {
         reply: classification.reply,
         classification: "NO_WORK",
         ai_calls: 1,
+        balance: credit.balance,
       });
     }
 
@@ -1118,9 +1247,13 @@ async function handleRequest(request, env) {
       classification: "NEED_WORK",
       sources,
       ai_calls: 2,
+      balance: credit.balance,
     });
   } catch (error) {
     console.error("WORKER ERROR:", error);
+
+    // The request failed after we charged, so give the credit back.
+    if (charged) await refundCredits(env, userId);
 
     const errorReply =
       "Sorry, I couldn't process your request right now. Please try again.";
